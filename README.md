@@ -65,7 +65,7 @@ Dry-run device and tracepoint assumptions:
 
 The host tool filters by exact Linux `dev_t`: Python reads each device's major/minor with `stat(2)` and inserts `(major << 20) | minor` into a BPF map. The BPF program drops all other block IO.
 
-Host output includes per-device read/write/flush/unmap/other IO counts, bytes, average IO size, log2 size histograms, and optional issue-to-complete latency histograms. Latency matching uses a composite key of `dev, sector, bytes, op` because the portable block tracepoint payload does not always expose a request pointer. This is usually good enough for per-device histogramming, but very high queue-depth repeated same-sector workloads can collide.
+Host output includes per-device read/write/flush/unmap/other IO counts, bytes, average IO size, log2 size histograms, and optional issue-to-complete latency histograms. Latency matching uses a composite key of `dev, sector, bytes, op` because the portable block tracepoint payload does not always expose a request pointer. This is usually good enough for per-device histogramming, but very high queue-depth repeated same-sector workloads can collide. Treat host latency histograms as approximate unless your tracepoint format exposes a stable request pointer and the code is extended to use it.
 
 ## Storage Server SPDK Usage
 
@@ -79,7 +79,7 @@ sudo ./spdk_io_observe_uprobe.py \
   --list-symbols
 ```
 
-Run auto-detected submit observation:
+Run auto-detected submit observation. Symbol auto-detection is now the default; `--symbols-auto-detect` is accepted only as a deprecated no-op for compatibility.
 
 ```bash
 sudo ./spdk_io_observe_uprobe.py \
@@ -87,11 +87,10 @@ sudo ./spdk_io_observe_uprobe.py \
   --binary /path/to/nvmf_tgt \
   --spdk-build-dir /path/to/spdk/build \
   --interval 1 \
-  --hist \
-  --symbols-auto-detect
+  --hist
 ```
 
-Force a known NVMe submit symbol:
+Force a known fixed-buffer NVMe submit symbol:
 
 ```bash
 sudo ./spdk_io_observe_uprobe.py \
@@ -99,10 +98,13 @@ sudo ./spdk_io_observe_uprobe.py \
   --binary <binary> \
   --submit-symbol spdk_nvme_ns_cmd_read \
   --interval 1 \
-  --hist
+  --hist \
+  --lba-size 512
 ```
 
-If read/write NVMe API symbols are attachable, the tool uses `lba_count * --lba-size` for size histograms. The default `--lba-size` is 512; set `--lba-size 4096` or the real namespace logical block size when needed.
+For `spdk_nvme_ns_cmd_read` and `spdk_nvme_ns_cmd_write`, the tool uses `lba_count * --lba-size` for size histograms. The default `--lba-size` is 512; set `--lba-size 4096` or the real namespace logical block size when needed.
+
+Important: `spdk_nvme_ns_cmd_readv` and `spdk_nvme_ns_cmd_writev` are listed by `--list-symbols` but are **not auto-attached** for size accounting. Their prototype/argument order can differ by SPDK version/build, so attaching them as if arg5 is `lba_count` can produce bogus byte histograms. Use them manually only after verifying the SPDK 26.05 header/prototype for your exact build.
 
 Latency can be requested:
 
@@ -116,7 +118,7 @@ sudo ./spdk_io_observe_uprobe.py \
   --latency
 ```
 
-Latency is only reported when a compatible completion symbol is found. The submit key is the SPDK object pointer available at the selected layer, such as a bdev IO pointer or NVMe qpair/request-related pointer. If submit and completion are from different SPDK layers, matching can be wrong; the tool warns and falls back to submit-side counts/histograms when no completion symbol is usable.
+Latency is only reported when a compatible completion symbol is found and the submit path exposes a usable per-IO object pointer. Fixed-buffer NVMe API submit symbols do not expose a stable request pointer in this observer, so latency falls back to submit-side counts/histograms. Pointer-only request/bdev fallback modes may show IO counts while marking `bytes`, `avg_size`, and size histograms as unsupported.
 
 Manual request-level latency can be attempted when you know the submit and completion functions expose the same request pointer:
 
@@ -148,10 +150,10 @@ objdump -t <binary> | grep nvme
 
 Priority submit candidates include:
 
-- `spdk_bdev_io_submit`, `bdev_io_submit`
-- `spdk_bdev_read`, `spdk_bdev_write`, block/readv/writev variants
-- `spdk_nvme_ns_cmd_read`, `spdk_nvme_ns_cmd_write`, readv/writev variants
-- `nvme_qpair_submit_request`, `nvme_transport_qpair_submit_request`
+- `spdk_nvme_ns_cmd_read`, `spdk_nvme_ns_cmd_write` for automatic size accounting.
+- `spdk_nvme_ns_cmd_readv`, `spdk_nvme_ns_cmd_writev` for manual/experimental attachment only after prototype verification.
+- `nvme_qpair_submit_request`, `nvme_transport_qpair_submit_request` for pointer-based latency experiments.
+- `spdk_bdev_io_submit`, `bdev_io_submit`, and bdev read/write variants as pointer-only fallbacks.
 
 Priority completion candidates include:
 
@@ -169,16 +171,17 @@ SPDK may be static or dynamic. Dynamic builds usually attach to `libspdk_bdev.so
 - Avoid inlining the specific function you want to probe.
 - If needed, add a lightweight wrapper with `__attribute__((noinline))` around the submit/completion point, or use SPDK tracepoints/USDT.
 
-This first implementation deliberately avoids hardcoded SPDK struct offsets. It provides stable minimum observation by pointer and function arguments. Enhanced bdev name, namespace, controller, qpair, and exact opcode decoding should be added through DWARF/BTF/pahole-derived offset profiles or explicit SPDK wrapper/tracepoint support for your exact SPDK 26.05 build.
+This implementation deliberately avoids hardcoded SPDK struct offsets. It provides stable minimum observation by pointer and function arguments. Enhanced bdev name, namespace, controller, qpair, and exact opcode decoding should be added through DWARF/BTF/pahole-derived offset profiles or explicit SPDK wrapper/tracepoint support for your exact SPDK 26.05 build.
 
 ## Validation
 
 1. On the GPU host, run `fio` against `/dev/nvme1n1` or `/dev/nvme3n1`.
-2. Confirm `nvme_io_observe_host.py` shows the selected device only and that size/latency histograms change.
-3. On the storage server, run `spdk_io_observe_uprobe.py --list-symbols`.
-4. Start the SPDK observer and confirm submit counts increase during the same workload.
-5. Compare counts with SPDK RPC/stat output where possible.
-6. Expect `iostat` and Linux block tracepoints on the storage server to miss vfio-owned physical SSD IO.
+2. Confirm `nvme_io_observe_host.py` shows the selected device only and that size histograms change.
+3. Add `--latency` only after basic count/size validation.
+4. On the storage server, run `spdk_io_observe_uprobe.py --list-symbols`.
+5. Start the SPDK observer with fixed-buffer `spdk_nvme_ns_cmd_read/write` when possible and confirm submit counts increase during the same workload.
+6. Compare counts with SPDK RPC/stat output where possible.
+7. Expect `iostat` and Linux block tracepoints on the storage server to miss vfio-owned physical SSD IO.
 
 ## Troubleshooting
 
@@ -189,6 +192,7 @@ This first implementation deliberately avoids hardcoded SPDK struct offsets. It 
 - `BCC version mismatch`: install matching BCC Python bindings and kernel headers; this code targets BCC 0.29 and 0.36 style APIs where practical.
 - `BPF verifier rejected program`: check kernel headers, tracepoint fields, and simplify options such as disabling `--latency`.
 - `no IO observed`: verify the device filter on the GPU host; on storage, verify the SPDK pid, binary path, symbol choice, and that the workload reaches that SPDK process.
+- `bytes=unsupported`: the observer attached to a pointer-only request/bdev fallback path. Use fixed-buffer `spdk_nvme_ns_cmd_read/write` for size histograms, or add a SPDK wrapper/USDT tracepoint that exposes size/opcode explicitly.
 
 ## Limitations
 
@@ -196,5 +200,6 @@ This first implementation deliberately avoids hardcoded SPDK struct offsets. It 
 - Function-boundary uprobes add overhead on very hot poll-mode IO paths.
 - Per-IO latency is reliable only when submit and completion expose the same object pointer.
 - Request pointer argument positions are build/symbol dependent; use `--req-submit-arg` and `--req-complete-arg` only after checking the selected SPDK function prototypes.
+- readv/writev byte accounting is intentionally not automatic because incorrect argument assumptions can silently produce invalid histograms.
 - Host block latency, DPU/SNAP emulation latency, NVMe-oF network latency, SPDK queueing, and physical SSD media latency are different layers and must be interpreted separately.
 - The host latency key can collide for repeated same-sector IO at high queue depth because portable block tracepoints do not expose a request pointer on all kernels.
