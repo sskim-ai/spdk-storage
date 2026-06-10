@@ -23,9 +23,20 @@ from common import (
 )
 
 
-# Safe default: use only fixed-buffer read/write APIs for byte accounting.
-# readv/writev prototypes can differ across SPDK versions/builds, so they are
-# discovered and attachable manually but not auto-attached for size histograms.
+# Size-capable backend symbols confirmed from the user's SPDK build.
+# Prototype:
+#   static int bdev_nvme_readv(struct nvme_bdev_io *bio,
+#       struct iovec *iov, int iovcnt, void *md,
+#       uint64_t lba_count, uint64_t lba, uint64_t flag,
+#       struct spdk_memory_domain *domain, void *domain_ctx,
+#       struct spdk_accel_sequence *seq)
+# Therefore lba_count is C arg5 == PT_REGS_PARM5(ctx) == bpftrace arg4.
+BDEV_NVME_SIZE_CANDIDATES = [
+    "bdev_nvme_readv",
+]
+
+# Safe fixed-buffer NVMe public APIs. These symbols may exist but are not
+# necessarily on the NVMf target runtime path.
 NVME_RW_SUBMIT_CANDIDATES = [
     "spdk_nvme_ns_cmd_read",
     "spdk_nvme_ns_cmd_write",
@@ -50,6 +61,7 @@ BDEV_SUBMIT_CANDIDATES = [
 ]
 
 REQUEST_SUBMIT_CANDIDATES = [
+    "bdev_nvme_submit_request",
     "nvme_qpair_submit_request",
     "nvme_transport_qpair_submit_request",
 ]
@@ -99,8 +111,7 @@ def build_bpf_text(want_latency: bool, lba_size: int, req_submit_arg: int, req_c
         increment_lat_hist(&hk);
         starts.delete(&req);
     }
-"""
-        .replace("COMPLETE_REQ_EXPR", complete_req)
+""".replace("COMPLETE_REQ_EXPR", complete_req)
         if want_latency
         else ""
     )
@@ -234,6 +245,12 @@ static __always_inline int submit_common(struct pt_regs *ctx, u32 op, u64 bytes,
     return 0;
 }}
 
+int trace_bdev_nvme_readv(struct pt_regs *ctx)
+{{
+    u64 lba_count = PT_REGS_PARM5(ctx);
+    return submit_common(ctx, 0, lba_count * {lba_size}ULL, 0);
+}}
+
 int trace_nvme_read(struct pt_regs *ctx)
 {{
     u64 lba_count = PT_REGS_PARM5(ctx);
@@ -331,6 +348,8 @@ def manual_hit(symbol: str, objects, obj_override: str = None) -> SymbolHit:
 
 def selected_mode(selected_submit_hits, latency_supported: bool) -> str:
     syms = [h.symbol for h in selected_submit_hits]
+    if all(sym in BDEV_NVME_SIZE_CANDIDATES for sym in syms):
+        return "bdev-nvme-readv-size"
     if all(sym in NVME_RW_SUBMIT_CANDIDATES for sym in syms):
         return "nvme-rw-size"
     if any(sym in NVME_VECTOR_SUBMIT_CANDIDATES for sym in syms):
@@ -347,9 +366,19 @@ def select_submit_hits(args, objects, submit_hits):
     selected = []
     seen = set()
 
-    # Prefer only fixed-buffer NVMe read/write APIs for automatic byte accounting.
-    # Do not auto-attach readv/writev: their prototype/argument order can differ,
-    # which can make PT_REGS_PARM5 produce a bogus size.
+    # Prefer the confirmed NVMf -> NVMe bdev backend path when present.
+    bdev_nvme_hits = [h for h in submit_hits if h.symbol in BDEV_NVME_SIZE_CANDIDATES]
+    if bdev_nvme_hits:
+        for sym in BDEV_NVME_SIZE_CANDIDATES:
+            for hit in bdev_nvme_hits:
+                key = (hit.obj, hit.symbol)
+                if hit.symbol == sym and key not in seen:
+                    seen.add(key)
+                    selected.append(hit)
+                    break
+        return selected
+
+    # Fall back to public fixed-buffer NVMe read/write APIs.
     nvme_hits = [h for h in submit_hits if h.symbol in NVME_RW_SUBMIT_CANDIDATES]
     if nvme_hits:
         for sym in NVME_RW_SUBMIT_CANDIDATES:
@@ -402,7 +431,7 @@ def main() -> int:
     parser.add_argument("--complete-object", help="object path for --complete-symbol when the symbol is not in --binary")
     parser.add_argument("--req-submit-arg", type=int, default=1, choices=[1, 2, 3, 4, 5, 6], help="argument index containing request pointer for generic request-level submit symbols")
     parser.add_argument("--req-complete-arg", type=int, default=1, choices=[1, 2, 3, 4, 5, 6], help="argument index containing request pointer for completion symbols")
-    parser.add_argument("--lba-size", type=int, default=512, help="NVMe logical block size for spdk_nvme_ns_cmd_* byte calculation")
+    parser.add_argument("--lba-size", type=int, default=512, help="logical block size used for lba_count-to-byte conversion")
     parser.add_argument("--list-symbols", action="store_true", help="list discovered candidate symbols and exit")
     parser.add_argument("--dry-run", action="store_true", help="show selected attach points without attaching")
     args = parser.parse_args()
@@ -415,14 +444,14 @@ def main() -> int:
     if not objects:
         parser.error("no binary/shared library objects found")
 
-    submit_candidates = NVME_SUBMIT_CANDIDATES + BDEV_SUBMIT_CANDIDATES + REQUEST_SUBMIT_CANDIDATES
+    submit_candidates = BDEV_NVME_SIZE_CANDIDATES + NVME_SUBMIT_CANDIDATES + BDEV_SUBMIT_CANDIDATES + REQUEST_SUBMIT_CANDIDATES
     submit_hits = discover_symbols(objects, submit_candidates)
     complete_hits = discover_symbols(objects, COMPLETE_CANDIDATES)
 
     if args.list_symbols:
         describe_hits("submit candidates:", submit_hits)
         describe_hits("completion candidates:", complete_hits)
-        print("note: readv/writev symbols are listed but not auto-attached for size accounting; attach manually only after verifying the SPDK 26.05 prototype.", file=sys.stderr)
+        print("note: bdev_nvme_readv is preferred when present because its confirmed prototype exposes lba_count as C arg5.", file=sys.stderr)
         return 0
 
     selected_submit_hits = select_submit_hits(args, objects, submit_hits)
@@ -435,13 +464,13 @@ def main() -> int:
 
     manual_vector = bool(args.submit_symbol and args.submit_symbol in NVME_VECTOR_SUBMIT_CANDIDATES)
     if manual_vector:
-        print("warning: manual readv/writev attach requested; byte accounting assumes arg5 is lba_count and must be verified against your SPDK 26.05 headers", file=sys.stderr)
+        print("warning: manual public NVMe readv/writev attach requested; byte accounting assumes arg5 is lba_count and must be verified against your SPDK headers", file=sys.stderr)
 
-    latency_submit_hits = [h for h in selected_submit_hits if h.symbol not in NVME_SUBMIT_CANDIDATES]
+    latency_submit_hits = [h for h in selected_submit_hits if h.symbol not in NVME_SUBMIT_CANDIDATES and h.symbol not in BDEV_NVME_SIZE_CANDIDATES]
     nvme_api_submit = all(h.symbol in NVME_SUBMIT_CANDIDATES for h in selected_submit_hits)
     latency_supported = args.latency and bool(complete_hit) and bool(latency_submit_hits)
     if args.latency and not latency_supported:
-        reason = "NVMe API submit symbols do not expose a stable per-IO request pointer" if nvme_api_submit else "completion symbol not found"
+        reason = "selected size-capable submit symbol does not expose a stable per-IO request pointer" if not nvme_api_submit else "NVMe API submit symbols do not expose a stable per-IO request pointer"
         print(f"warning: latency unsupported because {reason}; submit counts remain available", file=sys.stderr)
 
     mode = selected_mode(selected_submit_hits, latency_supported)
@@ -476,7 +505,8 @@ def main() -> int:
     b = BPF(text=build_bpf_text(latency_supported, args.lba_size, args.req_submit_arg, args.req_complete_arg))
     pid = args.pid if args.pid is not None else -1
     attached = []
-    nvme_submit_map = {
+    submit_fn_map = {
+        "bdev_nvme_readv": "trace_bdev_nvme_readv",
         "spdk_nvme_ns_cmd_read": "trace_nvme_read",
         "spdk_nvme_ns_cmd_write": "trace_nvme_write",
         # Manual only. Kept for deliberate experiments after prototype verification.
@@ -485,7 +515,7 @@ def main() -> int:
     }
     try:
         for hit in selected_submit_hits:
-            fn = nvme_submit_map.get(hit.symbol)
+            fn = submit_fn_map.get(hit.symbol)
             if fn is None:
                 fn = "trace_req_submit" if hit.symbol in REQUEST_SUBMIT_CANDIDATES or args.submit_symbol else "trace_bdev_submit"
             attach_uprobe_compat(b, hit.obj, hit.symbol, fn, pid)
