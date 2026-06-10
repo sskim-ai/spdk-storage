@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import ctypes as ct
-import os
 import signal
 import sys
 import time
@@ -24,12 +23,20 @@ from common import (
 )
 
 
-NVME_SUBMIT_CANDIDATES = [
+# Safe default: use only fixed-buffer read/write APIs for byte accounting.
+# readv/writev prototypes can differ across SPDK versions/builds, so they are
+# discovered and attachable manually but not auto-attached for size histograms.
+NVME_RW_SUBMIT_CANDIDATES = [
     "spdk_nvme_ns_cmd_read",
     "spdk_nvme_ns_cmd_write",
+]
+
+NVME_VECTOR_SUBMIT_CANDIDATES = [
     "spdk_nvme_ns_cmd_readv",
     "spdk_nvme_ns_cmd_writev",
 ]
+
+NVME_SUBMIT_CANDIDATES = NVME_RW_SUBMIT_CANDIDATES + NVME_VECTOR_SUBMIT_CANDIDATES
 
 BDEV_SUBMIT_CANDIDATES = [
     "spdk_bdev_io_submit",
@@ -60,6 +67,8 @@ def preg_arg(n: int) -> str:
         2: "PT_REGS_PARM2(ctx)",
         3: "PT_REGS_PARM3(ctx)",
         4: "PT_REGS_PARM4(ctx)",
+        5: "PT_REGS_PARM5(ctx)",
+        6: "PT_REGS_PARM6(ctx)",
     }.get(n, "PT_REGS_PARM1(ctx)")
 
 
@@ -163,24 +172,37 @@ static __always_inline void increment_lat_hist(struct hist_key *key)
     }}
 }}
 
-static __always_inline int submit_common(struct pt_regs *ctx, u32 op, u64 bytes, u64 req)
+static __always_inline void increment_stats(struct stat_key *key, u64 bytes)
 {{
-    u32 tid = (u32)bpf_get_current_pid_tgid();
-    save_comm(tid);
-    struct stat_key key = {{}};
-    key.op = op;
-    key.tid = tid;
     struct stat_val zero = {{}}, *val;
-    val = stats.lookup_or_try_init(&key, &zero);
+    val = stats.lookup(key);
+    if (!val) {{
+        stats.update(key, &zero);
+        val = stats.lookup(key);
+    }}
     if (val) {{
         __sync_fetch_and_add(&val->ios, 1);
         __sync_fetch_and_add(&val->bytes, bytes);
     }}
-    struct hist_key hk = {{}};
-    hk.op = op;
-    hk.tid = tid;
-    hk.slot = bpf_log2l(bytes ? bytes : 1);
-    increment_size_hist(&hk);
+}}
+
+static __always_inline int submit_common(struct pt_regs *ctx, u32 op, u64 bytes, u64 req)
+{{
+    u32 tid = (u32)bpf_get_current_pid_tgid();
+    save_comm(tid);
+
+    struct stat_key key = {{}};
+    key.op = op;
+    key.tid = tid;
+    increment_stats(&key, bytes);
+
+    if (bytes > 0) {{
+        struct hist_key hk = {{}};
+        hk.op = op;
+        hk.tid = tid;
+        hk.slot = bpf_log2l(bytes);
+        increment_size_hist(&hk);
+    }}
 {latency_submit}
     return 0;
 }}
@@ -272,20 +294,37 @@ def manual_hit(symbol: str, objects, obj_override: str = None) -> SymbolHit:
     return SymbolHit(obj=obj, symbol=symbol, source="manual")
 
 
+def selected_mode(selected_submit_hits, latency_supported: bool) -> str:
+    syms = [h.symbol for h in selected_submit_hits]
+    if all(sym in NVME_RW_SUBMIT_CANDIDATES for sym in syms):
+        return "nvme-rw-size"
+    if any(sym in NVME_VECTOR_SUBMIT_CANDIDATES for sym in syms):
+        return "manual-vector-experimental"
+    if latency_supported:
+        return "request-pointer-latency"
+    return "pointer-only-no-size"
+
+
 def select_submit_hits(args, objects, submit_hits):
     if args.submit_symbol:
         return [manual_hit(args.submit_symbol, objects, args.submit_object)]
+
     selected = []
     seen = set()
-    nvme_hits = [h for h in submit_hits if h.symbol in NVME_SUBMIT_CANDIDATES]
+
+    # Prefer only fixed-buffer NVMe read/write APIs for automatic byte accounting.
+    # Do not auto-attach readv/writev: their prototype/argument order can differ,
+    # which can make PT_REGS_PARM5 produce a bogus size.
+    nvme_hits = [h for h in submit_hits if h.symbol in NVME_RW_SUBMIT_CANDIDATES]
     if nvme_hits:
-        for sym in NVME_SUBMIT_CANDIDATES:
+        for sym in NVME_RW_SUBMIT_CANDIDATES:
             for hit in nvme_hits:
                 key = (hit.obj, hit.symbol)
                 if hit.symbol == sym and key not in seen:
                     seen.add(key)
                     selected.append(hit)
                     break
+
     if args.latency or not selected:
         req_first = choose_first([h for h in submit_hits if h.symbol in REQUEST_SUBMIT_CANDIDATES], REQUEST_SUBMIT_CANDIDATES)
         if req_first:
@@ -293,10 +332,12 @@ def select_submit_hits(args, objects, submit_hits):
             if key not in seen:
                 seen.add(key)
                 selected.append(req_first)
+
     if not selected:
         first = choose_first(submit_hits, BDEV_SUBMIT_CANDIDATES)
         if first:
             selected.append(first)
+
     return selected
 
 
@@ -310,13 +351,13 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON lines")
     parser.add_argument("--hist", action="store_true", help="print log2 size histogram")
     parser.add_argument("--latency", action="store_true", help="attempt pointer-based submit/complete latency")
-    parser.add_argument("--symbols-auto-detect", action="store_true", help="scan binary/build-dir for candidate symbols")
+    parser.add_argument("--symbols-auto-detect", action="store_true", help="deprecated no-op; symbol auto-detection is the default")
     parser.add_argument("--submit-symbol", help="manual submit symbol; attaches to --binary unless symbol is discovered elsewhere")
     parser.add_argument("--complete-symbol", help="manual completion symbol for latency")
     parser.add_argument("--submit-object", help="object path for --submit-symbol when the symbol is not in --binary")
     parser.add_argument("--complete-object", help="object path for --complete-symbol when the symbol is not in --binary")
-    parser.add_argument("--req-submit-arg", type=int, default=1, choices=[1, 2, 3, 4], help="argument index containing request pointer for generic request-level submit symbols")
-    parser.add_argument("--req-complete-arg", type=int, default=1, choices=[1, 2, 3, 4], help="argument index containing request pointer for completion symbols")
+    parser.add_argument("--req-submit-arg", type=int, default=1, choices=[1, 2, 3, 4, 5, 6], help="argument index containing request pointer for generic request-level submit symbols")
+    parser.add_argument("--req-complete-arg", type=int, default=1, choices=[1, 2, 3, 4, 5, 6], help="argument index containing request pointer for completion symbols")
     parser.add_argument("--lba-size", type=int, default=512, help="NVMe logical block size for spdk_nvme_ns_cmd_* byte calculation")
     parser.add_argument("--list-symbols", action="store_true", help="list discovered candidate symbols and exit")
     parser.add_argument("--dry-run", action="store_true", help="show selected attach points without attaching")
@@ -329,12 +370,15 @@ def main() -> int:
     objects = iter_elf_objects(args.binary, args.spdk_build_dir)
     if not objects:
         parser.error("no binary/shared library objects found")
+
     submit_candidates = NVME_SUBMIT_CANDIDATES + BDEV_SUBMIT_CANDIDATES + REQUEST_SUBMIT_CANDIDATES
     submit_hits = discover_symbols(objects, submit_candidates)
     complete_hits = discover_symbols(objects, COMPLETE_CANDIDATES)
+
     if args.list_symbols:
         describe_hits("submit candidates:", submit_hits)
         describe_hits("completion candidates:", complete_hits)
+        print("note: readv/writev symbols are listed but not auto-attached for size accounting; attach manually only after verifying the SPDK 26.05 prototype.", file=sys.stderr)
         return 0
 
     selected_submit_hits = select_submit_hits(args, objects, submit_hits)
@@ -344,12 +388,23 @@ def main() -> int:
         print("error: no attachable SPDK submit symbol found", file=sys.stderr)
         print("try: rebuild SPDK with debug symbols, disable LTO, do not strip binaries, or add a noinline wrapper/USDT tracepoint", file=sys.stderr)
         return 2
+
+    manual_vector = bool(args.submit_symbol and args.submit_symbol in NVME_VECTOR_SUBMIT_CANDIDATES)
+    if manual_vector:
+        print("warning: manual readv/writev attach requested; byte accounting assumes arg5 is lba_count and must be verified against your SPDK 26.05 headers", file=sys.stderr)
+
     latency_submit_hits = [h for h in selected_submit_hits if h.symbol not in NVME_SUBMIT_CANDIDATES]
     nvme_api_submit = all(h.symbol in NVME_SUBMIT_CANDIDATES for h in selected_submit_hits)
     latency_supported = args.latency and bool(complete_hit) and bool(latency_submit_hits)
     if args.latency and not latency_supported:
         reason = "NVMe API submit symbols do not expose a stable per-IO request pointer" if nvme_api_submit else "completion symbol not found"
-        print(f"warning: latency unsupported because {reason}; submit counts and size histograms remain available", file=sys.stderr)
+        print(f"warning: latency unsupported because {reason}; submit counts remain available", file=sys.stderr)
+
+    mode = selected_mode(selected_submit_hits, latency_supported)
+    zero_byte_fallback = mode in {"pointer-only-no-size", "request-pointer-latency"}
+
+    if zero_byte_fallback:
+        print("warning: selected submit path is pointer-only; bytes, avg_size, and size histogram are unsupported for this attach mode", file=sys.stderr)
 
     selected = {
         "submit": [h.__dict__ for h in selected_submit_hits],
@@ -357,6 +412,9 @@ def main() -> int:
         "pid": args.pid,
         "lba_size": args.lba_size,
         "latency_supported": latency_supported,
+        "mode": mode,
+        "bytes_supported": not zero_byte_fallback,
+        "size_hist_supported": not zero_byte_fallback,
         "req_submit_arg": args.req_submit_arg,
         "req_complete_arg": args.req_complete_arg,
     }
@@ -375,8 +433,9 @@ def main() -> int:
     attached = []
     nvme_submit_map = {
         "spdk_nvme_ns_cmd_read": "trace_nvme_read",
-        "spdk_nvme_ns_cmd_readv": "trace_nvme_read",
         "spdk_nvme_ns_cmd_write": "trace_nvme_write",
+        # Manual only. Kept for deliberate experiments after prototype verification.
+        "spdk_nvme_ns_cmd_readv": "trace_nvme_read",
         "spdk_nvme_ns_cmd_writev": "trace_nvme_write",
     }
     try:
@@ -395,6 +454,8 @@ def main() -> int:
         return 2
 
     print("attached: " + ", ".join(attached), file=sys.stderr)
+    print(f"mode={mode} bytes_supported={not zero_byte_fallback} latency_supported={latency_supported}", file=sys.stderr)
+
     stop = False
 
     def _stop(_signo, _frame):
@@ -405,6 +466,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _stop)
     prev_stats, prev_size, prev_lat = {}, {}, {}
     summary: Dict[Tuple[int, int], Tuple[int, int]] = {}
+
     while not stop:
         time.sleep(args.interval)
         names = thread_names(b["thread_names"])
@@ -415,23 +477,38 @@ def main() -> int:
         d_size = delta_hist(now_size, prev_size)
         d_lat = delta_hist(now_lat, prev_lat)
         prev_stats, prev_size, prev_lat = now_stats, now_size, now_lat
+
         for key, val in d_stats.items():
             old = summary.get(key, (0, 0))
             summary[key] = (old[0] + val[0], old[1] + val[1])
+
         if args.json:
             rows = []
             for (op, tid), (ios, bytes_) in sorted(d_stats.items()):
-                rows.append({"op": OP_NAMES.get(op, "other"), "tid": tid, "thread": names.get(tid, ""), "ios": ios, "bytes": bytes_, "avg_size": (bytes_ / ios if ios else 0)})
-            print(json_dumps({"ts": time.time(), "interval": args.interval, "stats": rows, "latency_supported": latency_supported}))
+                row = {"op": OP_NAMES.get(op, "other"), "tid": tid, "thread": names.get(tid, ""), "ios": ios}
+                if not zero_byte_fallback:
+                    row.update({"bytes": bytes_, "avg_size": (bytes_ / ios if ios else 0)})
+                else:
+                    row.update({"bytes": None, "avg_size": None})
+                rows.append(row)
+            print(json_dumps({"ts": time.time(), "interval": args.interval, "stats": rows, "mode": mode, "latency_supported": latency_supported}))
             continue
+
         print(time.strftime("%H:%M:%S"))
         for (op, tid), (ios, bytes_) in sorted(d_stats.items()):
-            avg = bytes_ / ios if ios else 0
-            print(f"tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes={bytes_:<12} avg_size={avg:.1f}")
-        if args.hist:
+            if zero_byte_fallback:
+                print(f"tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes=unsupported avg_size=unsupported")
+            else:
+                avg = bytes_ / ios if ios else 0
+                print(f"tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes={bytes_:<12} avg_size={avg:.1f}")
+
+        if args.hist and not zero_byte_fallback:
             for (op, tid) in sorted({(op, tid) for op, tid, _ in d_size}):
                 rows = {slot: cnt for (o, t, slot), cnt in d_size.items() if o == op and t == tid}
                 print_log2_hist(f"size tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows, "bytes")
+        elif args.hist and zero_byte_fallback:
+            print("size histogram unsupported for pointer-only attach mode")
+
         if latency_supported:
             for (op, tid) in sorted({(op, tid) for op, tid, _ in d_lat}):
                 rows = {slot: cnt for (o, t, slot), cnt in d_lat.items() if o == op and t == tid}
@@ -439,7 +516,10 @@ def main() -> int:
 
     print("summary", file=sys.stderr)
     for (op, tid), (ios, bytes_) in sorted(summary.items()):
-        print(f"tid={tid} {OP_NAMES.get(op, 'other')} ios={ios} bytes={bytes_}", file=sys.stderr)
+        if zero_byte_fallback:
+            print(f"tid={tid} {OP_NAMES.get(op, 'other')} ios={ios} bytes=unsupported", file=sys.stderr)
+        else:
+            print(f"tid={tid} {OP_NAMES.get(op, 'other')} ios={ios} bytes={bytes_}", file=sys.stderr)
     return 0
 
 
