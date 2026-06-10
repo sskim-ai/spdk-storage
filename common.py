@@ -28,13 +28,24 @@ OP_NAMES = {
 }
 
 
+def linux_new_encode_dev(major: int, minor: int) -> int:
+    """Return Linux's new_encode_dev() value used by block tracepoints.
+
+    The block tracepoint `dev` field is an encoded `dev_t`.  It is not the
+    simple `(major << 20) | minor` value.  Match the kernel encoding from
+    new_encode_dev() so BPF device filters compare against `args->dev`
+    correctly.
+    """
+    return ((minor & 0xff) | (major << 8) | ((minor & ~0xff) << 12)) & 0xFFFFFFFF
+
+
 def linux_dev_key(path: str) -> Tuple[int, int, int]:
     st = os.stat(path)
     if not stat.S_ISBLK(st.st_mode):
         raise ValueError(f"{path} is not a block device")
     major = os.major(st.st_rdev)
     minor = os.minor(st.st_rdev)
-    return major, minor, (major << 20) | minor
+    return major, minor, linux_new_encode_dev(major, minor)
 
 
 def log2_bucket_label(slot: int) -> str:
@@ -60,6 +71,17 @@ def json_dumps(obj) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
 
+def tracefs_paths() -> List[str]:
+    return ["/sys/kernel/debug/tracing", "/sys/kernel/tracing"]
+
+
+def first_existing_tracefs() -> Optional[str]:
+    for path in tracefs_paths():
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def require_root() -> None:
     if hasattr(os, "geteuid") and os.geteuid() != 0:
         print("warning: BCC tracing normally requires root/CAP_BPF/CAP_SYS_ADMIN", file=sys.stderr)
@@ -67,8 +89,8 @@ def require_root() -> None:
 
 def diagnostics() -> List[str]:
     out = []
-    if not os.path.exists("/sys/kernel/debug/tracing"):
-        out.append("debugfs/tracefs not found at /sys/kernel/debug/tracing; try: mount -t debugfs debugfs /sys/kernel/debug")
+    if first_existing_tracefs() is None:
+        out.append("tracefs not found at /sys/kernel/debug/tracing or /sys/kernel/tracing; try: mount -t debugfs debugfs /sys/kernel/debug && mount -t tracefs tracefs /sys/kernel/debug/tracing")
     if shutil.which("bpftool") is None:
         out.append("bpftool not found; optional but useful for verifier diagnostics")
     return out
