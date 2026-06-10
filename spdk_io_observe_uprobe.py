@@ -23,16 +23,18 @@ from common import (
 )
 
 
-# Size-capable backend symbols confirmed from the user's SPDK build.
-# Prototype:
+# Size-capable backend symbols for the NVMf -> NVMe bdev path.
+# Confirmed read prototype from the user's SPDK build:
 #   static int bdev_nvme_readv(struct nvme_bdev_io *bio,
 #       struct iovec *iov, int iovcnt, void *md,
 #       uint64_t lba_count, uint64_t lba, uint64_t flag,
 #       struct spdk_memory_domain *domain, void *domain_ctx,
 #       struct spdk_accel_sequence *seq)
 # Therefore lba_count is C arg5 == PT_REGS_PARM5(ctx) == bpftrace arg4.
+# bdev_nvme_writev is treated as the analogous write submit symbol when present.
 BDEV_NVME_SIZE_CANDIDATES = [
     "bdev_nvme_readv",
+    "bdev_nvme_writev",
 ]
 
 # Safe fixed-buffer NVMe public APIs. These symbols may exist but are not
@@ -251,6 +253,12 @@ int trace_bdev_nvme_readv(struct pt_regs *ctx)
     return submit_common(ctx, 0, lba_count * {lba_size}ULL, 0);
 }}
 
+int trace_bdev_nvme_writev(struct pt_regs *ctx)
+{{
+    u64 lba_count = PT_REGS_PARM5(ctx);
+    return submit_common(ctx, 1, lba_count * {lba_size}ULL, 0);
+}}
+
 int trace_nvme_read(struct pt_regs *ctx)
 {{
     u64 lba_count = PT_REGS_PARM5(ctx);
@@ -348,8 +356,8 @@ def manual_hit(symbol: str, objects, obj_override: str = None) -> SymbolHit:
 
 def selected_mode(selected_submit_hits, latency_supported: bool) -> str:
     syms = [h.symbol for h in selected_submit_hits]
-    if all(sym in BDEV_NVME_SIZE_CANDIDATES for sym in syms):
-        return "bdev-nvme-readv-size"
+    if any(sym in BDEV_NVME_SIZE_CANDIDATES for sym in syms):
+        return "bdev-nvme-rw-size"
     if all(sym in NVME_RW_SUBMIT_CANDIDATES for sym in syms):
         return "nvme-rw-size"
     if any(sym in NVME_VECTOR_SUBMIT_CANDIDATES for sym in syms):
@@ -451,7 +459,7 @@ def main() -> int:
     if args.list_symbols:
         describe_hits("submit candidates:", submit_hits)
         describe_hits("completion candidates:", complete_hits)
-        print("note: bdev_nvme_readv is preferred when present because its confirmed prototype exposes lba_count as C arg5.", file=sys.stderr)
+        print("note: bdev_nvme_readv/writev are preferred when present because their backend prototypes expose lba_count as C arg5.", file=sys.stderr)
         return 0
 
     selected_submit_hits = select_submit_hits(args, objects, submit_hits)
@@ -507,6 +515,7 @@ def main() -> int:
     attached = []
     submit_fn_map = {
         "bdev_nvme_readv": "trace_bdev_nvme_readv",
+        "bdev_nvme_writev": "trace_bdev_nvme_writev",
         "spdk_nvme_ns_cmd_read": "trace_nvme_read",
         "spdk_nvme_ns_cmd_write": "trace_nvme_write",
         # Manual only. Kept for deliberate experiments after prototype verification.
