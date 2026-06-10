@@ -23,7 +23,19 @@ from common import (
 )
 
 
-# Size-capable backend symbols for the NVMf -> NVMe bdev path.
+# Size-capable common backend submit symbol for the user's NVMf -> NVMe bdev path.
+# Prototype confirmed from the user's SPDK build:
+#   static void bdev_nvme_submit_request(struct spdk_io_channel *ch,
+#                                        struct spdk_bdev_io *bdev_io)
+# The user's debug/bpftrace validation confirmed:
+#   bdev_io->type offset                 = 0x8
+#   bdev_io->u.bdev.num_blocks offset    = 0x250
+# This captures read/write through the same physical backend submit path.
+BDEV_NVME_STRUCT_SIZE_CANDIDATES = [
+    "bdev_nvme_submit_request",
+]
+
+# Size-capable backend symbols for builds where readv/writev survive as symbols.
 # Confirmed read prototype from the user's SPDK build:
 #   static int bdev_nvme_readv(struct nvme_bdev_io *bio,
 #       struct iovec *iov, int iovcnt, void *md,
@@ -31,7 +43,6 @@ from common import (
 #       struct spdk_memory_domain *domain, void *domain_ctx,
 #       struct spdk_accel_sequence *seq)
 # Therefore lba_count is C arg5 == PT_REGS_PARM5(ctx) == bpftrace arg4.
-# bdev_nvme_writev is treated as the analogous write submit symbol when present.
 BDEV_NVME_SIZE_CANDIDATES = [
     "bdev_nvme_readv",
     "bdev_nvme_writev",
@@ -63,7 +74,6 @@ BDEV_SUBMIT_CANDIDATES = [
 ]
 
 REQUEST_SUBMIT_CANDIDATES = [
-    "bdev_nvme_submit_request",
     "nvme_qpair_submit_request",
     "nvme_transport_qpair_submit_request",
 ]
@@ -73,6 +83,10 @@ COMPLETE_CANDIDATES = [
     "bdev_io_complete",
     "nvme_complete_request",
 ]
+
+
+def parse_int_auto(value: str) -> int:
+    return int(value, 0)
 
 
 def preg_arg(n: int) -> str:
@@ -86,7 +100,16 @@ def preg_arg(n: int) -> str:
     }.get(n, "PT_REGS_PARM1(ctx)")
 
 
-def build_bpf_text(want_latency: bool, lba_size: int, req_submit_arg: int, req_complete_arg: int) -> str:
+def build_bpf_text(
+    want_latency: bool,
+    lba_size: int,
+    req_submit_arg: int,
+    req_complete_arg: int,
+    bdev_io_type_offset: int,
+    bdev_io_num_blocks_offset: int,
+    bdev_io_read_type: int,
+    bdev_io_write_type: int,
+) -> str:
     latency_submit = (
         """
     if (req != 0) {
@@ -247,6 +270,23 @@ static __always_inline int submit_common(struct pt_regs *ctx, u32 op, u64 bytes,
     return 0;
 }}
 
+int trace_bdev_nvme_submit_request(struct pt_regs *ctx)
+{{
+    u64 bdev_io = PT_REGS_PARM2(ctx);
+    u8 io_type = 0;
+    u64 num_blocks = 0;
+    bpf_probe_read_user(&io_type, sizeof(io_type), (void *)(bdev_io + {bdev_io_type_offset}ULL));
+    bpf_probe_read_user(&num_blocks, sizeof(num_blocks), (void *)(bdev_io + {bdev_io_num_blocks_offset}ULL));
+
+    u32 op = 4;
+    if (io_type == {bdev_io_read_type}) {{
+        op = 0;
+    }} else if (io_type == {bdev_io_write_type}) {{
+        op = 1;
+    }}
+    return submit_common(ctx, op, num_blocks * {lba_size}ULL, 0);
+}}
+
 int trace_bdev_nvme_readv(struct pt_regs *ctx)
 {{
     u64 lba_count = PT_REGS_PARM5(ctx);
@@ -356,6 +396,8 @@ def manual_hit(symbol: str, objects, obj_override: str = None) -> SymbolHit:
 
 def selected_mode(selected_submit_hits, latency_supported: bool) -> str:
     syms = [h.symbol for h in selected_submit_hits]
+    if any(sym in BDEV_NVME_STRUCT_SIZE_CANDIDATES for sym in syms):
+        return "bdev-nvme-submit-request-size"
     if any(sym in BDEV_NVME_SIZE_CANDIDATES for sym in syms):
         return "bdev-nvme-rw-size"
     if all(sym in NVME_RW_SUBMIT_CANDIDATES for sym in syms):
@@ -374,7 +416,15 @@ def select_submit_hits(args, objects, submit_hits):
     selected = []
     seen = set()
 
-    # Prefer the confirmed NVMf -> NVMe bdev backend path when present.
+    # Prefer common bdev NVMe submit_request when present: it captures both
+    # read and write, including builds where bdev_nvme_writev was inlined away.
+    bdev_struct_hits = [h for h in submit_hits if h.symbol in BDEV_NVME_STRUCT_SIZE_CANDIDATES]
+    if bdev_struct_hits:
+        first = choose_first(bdev_struct_hits, BDEV_NVME_STRUCT_SIZE_CANDIDATES)
+        if first:
+            return [first]
+
+    # Fall back to confirmed NVMf -> NVMe bdev readv/writev backend symbols.
     bdev_nvme_hits = [h for h in submit_hits if h.symbol in BDEV_NVME_SIZE_CANDIDATES]
     if bdev_nvme_hits:
         for sym in BDEV_NVME_SIZE_CANDIDATES:
@@ -440,6 +490,10 @@ def main() -> int:
     parser.add_argument("--req-submit-arg", type=int, default=1, choices=[1, 2, 3, 4, 5, 6], help="argument index containing request pointer for generic request-level submit symbols")
     parser.add_argument("--req-complete-arg", type=int, default=1, choices=[1, 2, 3, 4, 5, 6], help="argument index containing request pointer for completion symbols")
     parser.add_argument("--lba-size", type=int, default=512, help="logical block size used for lba_count-to-byte conversion")
+    parser.add_argument("--bdev-io-type-offset", type=parse_int_auto, default=0x8, help="offset of struct spdk_bdev_io.type; accepts hex, default 0x8")
+    parser.add_argument("--bdev-io-num-blocks-offset", type=parse_int_auto, default=0x250, help="offset of struct spdk_bdev_io.u.bdev.num_blocks; accepts hex, default 0x250")
+    parser.add_argument("--bdev-io-read-type", type=parse_int_auto, default=1, help="SPDK_BDEV_IO_TYPE_READ numeric value, default 1")
+    parser.add_argument("--bdev-io-write-type", type=parse_int_auto, default=2, help="SPDK_BDEV_IO_TYPE_WRITE numeric value, default 2")
     parser.add_argument("--list-symbols", action="store_true", help="list discovered candidate symbols and exit")
     parser.add_argument("--dry-run", action="store_true", help="show selected attach points without attaching")
     args = parser.parse_args()
@@ -452,14 +506,14 @@ def main() -> int:
     if not objects:
         parser.error("no binary/shared library objects found")
 
-    submit_candidates = BDEV_NVME_SIZE_CANDIDATES + NVME_SUBMIT_CANDIDATES + BDEV_SUBMIT_CANDIDATES + REQUEST_SUBMIT_CANDIDATES
+    submit_candidates = BDEV_NVME_STRUCT_SIZE_CANDIDATES + BDEV_NVME_SIZE_CANDIDATES + NVME_SUBMIT_CANDIDATES + BDEV_SUBMIT_CANDIDATES + REQUEST_SUBMIT_CANDIDATES
     submit_hits = discover_symbols(objects, submit_candidates)
     complete_hits = discover_symbols(objects, COMPLETE_CANDIDATES)
 
     if args.list_symbols:
         describe_hits("submit candidates:", submit_hits)
         describe_hits("completion candidates:", complete_hits)
-        print("note: bdev_nvme_readv/writev are preferred when present because their backend prototypes expose lba_count as C arg5.", file=sys.stderr)
+        print("note: bdev_nvme_submit_request is preferred when present because it exposes struct spdk_bdev_io for read/write size accounting via offsets.", file=sys.stderr)
         return 0
 
     selected_submit_hits = select_submit_hits(args, objects, submit_hits)
@@ -474,7 +528,7 @@ def main() -> int:
     if manual_vector:
         print("warning: manual public NVMe readv/writev attach requested; byte accounting assumes arg5 is lba_count and must be verified against your SPDK headers", file=sys.stderr)
 
-    latency_submit_hits = [h for h in selected_submit_hits if h.symbol not in NVME_SUBMIT_CANDIDATES and h.symbol not in BDEV_NVME_SIZE_CANDIDATES]
+    latency_submit_hits = [h for h in selected_submit_hits if h.symbol not in NVME_SUBMIT_CANDIDATES and h.symbol not in BDEV_NVME_SIZE_CANDIDATES and h.symbol not in BDEV_NVME_STRUCT_SIZE_CANDIDATES]
     nvme_api_submit = all(h.symbol in NVME_SUBMIT_CANDIDATES for h in selected_submit_hits)
     latency_supported = args.latency and bool(complete_hit) and bool(latency_submit_hits)
     if args.latency and not latency_supported:
@@ -499,6 +553,10 @@ def main() -> int:
         "size_counts_supported": not zero_byte_fallback,
         "req_submit_arg": args.req_submit_arg,
         "req_complete_arg": args.req_complete_arg,
+        "bdev_io_type_offset": args.bdev_io_type_offset,
+        "bdev_io_num_blocks_offset": args.bdev_io_num_blocks_offset,
+        "bdev_io_read_type": args.bdev_io_read_type,
+        "bdev_io_write_type": args.bdev_io_write_type,
     }
     if args.dry_run:
         print(json_dumps(selected))
@@ -510,10 +568,20 @@ def main() -> int:
         print(f"failed to import BCC: {exc}", file=sys.stderr)
         return 2
 
-    b = BPF(text=build_bpf_text(latency_supported, args.lba_size, args.req_submit_arg, args.req_complete_arg))
+    b = BPF(text=build_bpf_text(
+        latency_supported,
+        args.lba_size,
+        args.req_submit_arg,
+        args.req_complete_arg,
+        args.bdev_io_type_offset,
+        args.bdev_io_num_blocks_offset,
+        args.bdev_io_read_type,
+        args.bdev_io_write_type,
+    ))
     pid = args.pid if args.pid is not None else -1
     attached = []
     submit_fn_map = {
+        "bdev_nvme_submit_request": "trace_bdev_nvme_submit_request",
         "bdev_nvme_readv": "trace_bdev_nvme_readv",
         "bdev_nvme_writev": "trace_bdev_nvme_writev",
         "spdk_nvme_ns_cmd_read": "trace_nvme_read",
