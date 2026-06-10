@@ -230,7 +230,10 @@ def main() -> int:
         path = raw.strip()
         if not path:
             continue
-        major, minor, key = linux_dev_key(path)
+        try:
+            major, minor, key = linux_dev_key(path)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
         devs[key] = {"path": path, "major": major, "minor": minor, "dev": key}
     if not devs:
         parser.error("--devices did not contain any paths")
@@ -269,6 +272,7 @@ def main() -> int:
         stop = True
 
     signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
     prev_stats, prev_size, prev_lat = {}, {}, {}
     summary: Dict[Tuple[int, int], Tuple[int, int]] = {}
     while not stop:

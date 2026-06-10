@@ -42,16 +42,28 @@ BDEV_SUBMIT_CANDIDATES = [
     "spdk_bdev_writev",
 ]
 
+REQUEST_SUBMIT_CANDIDATES = [
+    "nvme_qpair_submit_request",
+    "nvme_transport_qpair_submit_request",
+]
+
 COMPLETE_CANDIDATES = [
     "spdk_bdev_io_complete",
     "bdev_io_complete",
     "nvme_complete_request",
-    "spdk_nvme_qpair_process_completions",
-    "nvme_pcie_qpair_process_completions",
 ]
 
 
-def build_bpf_text(want_latency: bool, lba_size: int) -> str:
+def preg_arg(n: int) -> str:
+    return {
+        1: "PT_REGS_PARM1(ctx)",
+        2: "PT_REGS_PARM2(ctx)",
+        3: "PT_REGS_PARM3(ctx)",
+        4: "PT_REGS_PARM4(ctx)",
+    }.get(n, "PT_REGS_PARM1(ctx)")
+
+
+def build_bpf_text(want_latency: bool, lba_size: int, req_submit_arg: int, req_complete_arg: int) -> str:
     latency_submit = (
         """
     if (req != 0) {
@@ -64,9 +76,10 @@ def build_bpf_text(want_latency: bool, lba_size: int) -> str:
         if want_latency
         else ""
     )
+    complete_req = preg_arg(req_complete_arg)
     latency_complete = (
         """
-    u64 req = PT_REGS_PARM1(ctx);
+    u64 req = COMPLETE_REQ_EXPR;
     struct start_val *sv = starts.lookup(&req);
     if (sv) {
         u64 delta_us = (bpf_ktime_get_ns() - sv->ts) / 1000;
@@ -78,9 +91,11 @@ def build_bpf_text(want_latency: bool, lba_size: int) -> str:
         starts.delete(&req);
     }
 """
+        .replace("COMPLETE_REQ_EXPR", complete_req)
         if want_latency
         else ""
     )
+    submit_req = preg_arg(req_submit_arg)
     return f"""
 #include <uapi/linux/ptrace.h>
 
@@ -187,6 +202,11 @@ int trace_bdev_submit(struct pt_regs *ctx)
     return submit_common(ctx, 4, 0, PT_REGS_PARM1(ctx));
 }}
 
+int trace_req_submit(struct pt_regs *ctx)
+{{
+    return submit_common(ctx, 4, 0, {submit_req});
+}}
+
 int trace_complete(struct pt_regs *ctx)
 {{
 {latency_complete}
@@ -247,17 +267,18 @@ def thread_names(table) -> Dict[int, str]:
     return out
 
 
-def manual_hit(symbol: str, objects) -> SymbolHit:
-    return SymbolHit(obj=objects[0], symbol=symbol, source="manual")
+def manual_hit(symbol: str, objects, obj_override: str = None) -> SymbolHit:
+    obj = obj_override or objects[0]
+    return SymbolHit(obj=obj, symbol=symbol, source="manual")
 
 
 def select_submit_hits(args, objects, submit_hits):
     if args.submit_symbol:
-        return [manual_hit(args.submit_symbol, objects)]
+        return [manual_hit(args.submit_symbol, objects, args.submit_object)]
+    selected = []
+    seen = set()
     nvme_hits = [h for h in submit_hits if h.symbol in NVME_SUBMIT_CANDIDATES]
     if nvme_hits:
-        seen = set()
-        selected = []
         for sym in NVME_SUBMIT_CANDIDATES:
             for hit in nvme_hits:
                 key = (hit.obj, hit.symbol)
@@ -265,9 +286,18 @@ def select_submit_hits(args, objects, submit_hits):
                     seen.add(key)
                     selected.append(hit)
                     break
-        return selected
-    first = choose_first(submit_hits, BDEV_SUBMIT_CANDIDATES)
-    return [first] if first else []
+    if args.latency or not selected:
+        req_first = choose_first([h for h in submit_hits if h.symbol in REQUEST_SUBMIT_CANDIDATES], REQUEST_SUBMIT_CANDIDATES)
+        if req_first:
+            key = (req_first.obj, req_first.symbol)
+            if key not in seen:
+                seen.add(key)
+                selected.append(req_first)
+    if not selected:
+        first = choose_first(submit_hits, BDEV_SUBMIT_CANDIDATES)
+        if first:
+            selected.append(first)
+    return selected
 
 
 def main() -> int:
@@ -283,6 +313,10 @@ def main() -> int:
     parser.add_argument("--symbols-auto-detect", action="store_true", help="scan binary/build-dir for candidate symbols")
     parser.add_argument("--submit-symbol", help="manual submit symbol; attaches to --binary unless symbol is discovered elsewhere")
     parser.add_argument("--complete-symbol", help="manual completion symbol for latency")
+    parser.add_argument("--submit-object", help="object path for --submit-symbol when the symbol is not in --binary")
+    parser.add_argument("--complete-object", help="object path for --complete-symbol when the symbol is not in --binary")
+    parser.add_argument("--req-submit-arg", type=int, default=1, choices=[1, 2, 3, 4], help="argument index containing request pointer for generic request-level submit symbols")
+    parser.add_argument("--req-complete-arg", type=int, default=1, choices=[1, 2, 3, 4], help="argument index containing request pointer for completion symbols")
     parser.add_argument("--lba-size", type=int, default=512, help="NVMe logical block size for spdk_nvme_ns_cmd_* byte calculation")
     parser.add_argument("--list-symbols", action="store_true", help="list discovered candidate symbols and exit")
     parser.add_argument("--dry-run", action="store_true", help="show selected attach points without attaching")
@@ -295,7 +329,7 @@ def main() -> int:
     objects = iter_elf_objects(args.binary, args.spdk_build_dir)
     if not objects:
         parser.error("no binary/shared library objects found")
-    submit_candidates = NVME_SUBMIT_CANDIDATES + BDEV_SUBMIT_CANDIDATES
+    submit_candidates = NVME_SUBMIT_CANDIDATES + BDEV_SUBMIT_CANDIDATES + REQUEST_SUBMIT_CANDIDATES
     submit_hits = discover_symbols(objects, submit_candidates)
     complete_hits = discover_symbols(objects, COMPLETE_CANDIDATES)
     if args.list_symbols:
@@ -305,13 +339,14 @@ def main() -> int:
 
     selected_submit_hits = select_submit_hits(args, objects, submit_hits)
     submit_hit = selected_submit_hits[0] if selected_submit_hits else None
-    complete_hit = manual_hit(args.complete_symbol, objects) if args.complete_symbol else choose_first(complete_hits, COMPLETE_CANDIDATES)
+    complete_hit = manual_hit(args.complete_symbol, objects, args.complete_object) if args.complete_symbol else choose_first(complete_hits, COMPLETE_CANDIDATES)
     if not submit_hit:
         print("error: no attachable SPDK submit symbol found", file=sys.stderr)
         print("try: rebuild SPDK with debug symbols, disable LTO, do not strip binaries, or add a noinline wrapper/USDT tracepoint", file=sys.stderr)
         return 2
-    nvme_api_submit = submit_hit.symbol in NVME_SUBMIT_CANDIDATES
-    latency_supported = args.latency and bool(complete_hit) and not nvme_api_submit
+    latency_submit_hits = [h for h in selected_submit_hits if h.symbol not in NVME_SUBMIT_CANDIDATES]
+    nvme_api_submit = all(h.symbol in NVME_SUBMIT_CANDIDATES for h in selected_submit_hits)
+    latency_supported = args.latency and bool(complete_hit) and bool(latency_submit_hits)
     if args.latency and not latency_supported:
         reason = "NVMe API submit symbols do not expose a stable per-IO request pointer" if nvme_api_submit else "completion symbol not found"
         print(f"warning: latency unsupported because {reason}; submit counts and size histograms remain available", file=sys.stderr)
@@ -322,6 +357,8 @@ def main() -> int:
         "pid": args.pid,
         "lba_size": args.lba_size,
         "latency_supported": latency_supported,
+        "req_submit_arg": args.req_submit_arg,
+        "req_complete_arg": args.req_complete_arg,
     }
     if args.dry_run:
         print(json_dumps(selected))
@@ -333,7 +370,7 @@ def main() -> int:
         print(f"failed to import BCC: {exc}", file=sys.stderr)
         return 2
 
-    b = BPF(text=build_bpf_text(latency_supported, args.lba_size))
+    b = BPF(text=build_bpf_text(latency_supported, args.lba_size, args.req_submit_arg, args.req_complete_arg))
     pid = args.pid if args.pid is not None else -1
     attached = []
     nvme_submit_map = {
@@ -344,7 +381,9 @@ def main() -> int:
     }
     try:
         for hit in selected_submit_hits:
-            fn = nvme_submit_map.get(hit.symbol, "trace_bdev_submit")
+            fn = nvme_submit_map.get(hit.symbol)
+            if fn is None:
+                fn = "trace_req_submit" if hit.symbol in REQUEST_SUBMIT_CANDIDATES or args.submit_symbol else "trace_bdev_submit"
             attach_uprobe_compat(b, hit.obj, hit.symbol, fn, pid)
             attached.append(f"{hit.symbol}@{hit.obj}->{fn}")
         if latency_supported and complete_hit:
@@ -363,6 +402,7 @@ def main() -> int:
         stop = True
 
     signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
     prev_stats, prev_size, prev_lat = {}, {}, {}
     summary: Dict[Tuple[int, int], Tuple[int, int]] = {}
     while not stop:

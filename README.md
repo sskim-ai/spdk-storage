@@ -118,6 +118,23 @@ sudo ./spdk_io_observe_uprobe.py \
 
 Latency is only reported when a compatible completion symbol is found. The submit key is the SPDK object pointer available at the selected layer, such as a bdev IO pointer or NVMe qpair/request-related pointer. If submit and completion are from different SPDK layers, matching can be wrong; the tool warns and falls back to submit-side counts/histograms when no completion symbol is usable.
 
+Manual request-level latency can be attempted when you know the submit and completion functions expose the same request pointer:
+
+```bash
+sudo ./spdk_io_observe_uprobe.py \
+  --pid $(pidof nvmf_tgt) \
+  --binary /path/to/nvmf_tgt \
+  --spdk-build-dir /path/to/spdk/build \
+  --submit-symbol nvme_qpair_submit_request \
+  --complete-symbol nvme_complete_request \
+  --req-submit-arg 2 \
+  --req-complete-arg 1 \
+  --latency \
+  --hist
+```
+
+Use `--submit-object` or `--complete-object` when a manual symbol lives in a shared library instead of `--binary`. The request pointer argument positions are SPDK-build and symbol dependent, so verify the prototype before relying on latency data.
+
 ## Symbol Discovery
 
 The SPDK observer scans the target executable and `.so` files below `--spdk-build-dir` using available tools:
@@ -178,5 +195,6 @@ This first implementation deliberately avoids hardcoded SPDK struct offsets. It 
 - SPDK internal functions can be inline/static or stripped, making uprobes impossible.
 - Function-boundary uprobes add overhead on very hot poll-mode IO paths.
 - Per-IO latency is reliable only when submit and completion expose the same object pointer.
+- Request pointer argument positions are build/symbol dependent; use `--req-submit-arg` and `--req-complete-arg` only after checking the selected SPDK function prototypes.
 - Host block latency, DPU/SNAP emulation latency, NVMe-oF network latency, SPDK queueing, and physical SSD media latency are different layers and must be interpreted separately.
 - The host latency key can collide for repeated same-sector IO at high queue depth because portable block tracepoints do not expose a request pointer on all kernels.

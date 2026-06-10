@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -29,6 +30,8 @@ OP_NAMES = {
 
 def linux_dev_key(path: str) -> Tuple[int, int, int]:
     st = os.stat(path)
+    if not stat.S_ISBLK(st.st_mode):
+        raise ValueError(f"{path} is not a block device")
     major = os.major(st.st_rdev)
     minor = os.minor(st.st_rdev)
     return major, minor, (major << 20) | minor
@@ -71,10 +74,10 @@ def diagnostics() -> List[str]:
     return out
 
 
-def run_tool(args: Sequence[str]) -> str:
+def run_tool(args: Sequence[str], timeout: int = 10) -> str:
     try:
-        return subprocess.check_output(args, stderr=subprocess.DEVNULL, text=True)
-    except (OSError, subprocess.CalledProcessError):
+        return subprocess.check_output(args, stderr=subprocess.DEVNULL, text=True, timeout=timeout)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return ""
 
 
