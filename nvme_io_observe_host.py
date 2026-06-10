@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import ctypes as ct
-import os
 import signal
 import sys
 import time
@@ -134,6 +133,20 @@ static __always_inline void increment_lat_hist(struct hist_key *key)
     }}
 }}
 
+static __always_inline void increment_stats(struct stat_key *key, u64 bytes)
+{{
+    struct stat_val zero = {{}}, *val;
+    val = stats.lookup(key);
+    if (!val) {{
+        stats.update(key, &zero);
+        val = stats.lookup(key);
+    }}
+    if (val) {{
+        __sync_fetch_and_add(&val->ios, 1);
+        __sync_fetch_and_add(&val->bytes, bytes);
+    }}
+}}
+
 TRACEPOINT_PROBE(block, block_rq_issue)
 {{
     u32 dev = args->dev;
@@ -146,12 +159,7 @@ TRACEPOINT_PROBE(block, block_rq_issue)
     struct stat_key key = {{}};
     key.dev = dev;
     key.op = op;
-    struct stat_val zero = {{}}, *val;
-    val = stats.lookup_or_try_init(&key, &zero);
-    if (val) {{
-        __sync_fetch_and_add(&val->ios, 1);
-        __sync_fetch_and_add(&val->bytes, bytes);
-    }}
+    increment_stats(&key, bytes);
 
     struct hist_key hk = {{}};
     hk.dev = dev;
