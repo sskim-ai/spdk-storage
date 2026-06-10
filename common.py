@@ -28,15 +28,14 @@ OP_NAMES = {
 }
 
 
-def linux_new_encode_dev(major: int, minor: int) -> int:
-    """Return Linux's new_encode_dev() value used by block tracepoints.
+def linux_block_trace_dev_key(major: int, minor: int) -> int:
+    """Return the dev value observed by this host's block tracepoints.
 
-    The block tracepoint `dev` field is an encoded `dev_t`.  It is not the
-    simple `(major << 20) | minor` value.  Match the kernel encoding from
-    new_encode_dev() so BPF device filters compare against `args->dev`
-    correctly.
+    On the user's Ubuntu/BCC host, block:block_rq_issue reports dev as
+    `(major << 20) | minor`, e.g. major 259 minor 1 appears as 0x10300001.
+    Keep this encoding for BPF map filtering against `args->dev`.
     """
-    return ((minor & 0xff) | (major << 8) | ((minor & ~0xff) << 12)) & 0xFFFFFFFF
+    return ((major << 20) | minor) & 0xFFFFFFFF
 
 
 def linux_dev_key(path: str) -> Tuple[int, int, int]:
@@ -45,7 +44,7 @@ def linux_dev_key(path: str) -> Tuple[int, int, int]:
         raise ValueError(f"{path} is not a block device")
     major = os.major(st.st_rdev)
     minor = os.minor(st.st_rdev)
-    return major, minor, linux_new_encode_dev(major, minor)
+    return major, minor, linux_block_trace_dev_key(major, minor)
 
 
 def log2_bucket_label(slot: int) -> str:
