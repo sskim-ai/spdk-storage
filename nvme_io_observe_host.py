@@ -10,21 +10,41 @@ import sys
 import time
 from typing import Dict, Tuple
 
-from common import OP_NAMES, diagnostics, json_dumps, linux_dev_key, print_log2_hist, require_root
+from common import (
+    OP_NAMES,
+    diagnostics,
+    first_existing_tracefs,
+    json_dumps,
+    linux_dev_key,
+    print_log2_hist,
+    require_root,
+)
 
 
 def tracepoint_format(tp: str) -> str:
-    path = f"/sys/kernel/debug/tracing/events/{tp}/format"
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except OSError:
-        return ""
+    for root in [first_existing_tracefs(), "/sys/kernel/debug/tracing", "/sys/kernel/tracing"]:
+        if not root:
+            continue
+        path = f"{root}/events/{tp}/format"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            continue
+    return ""
 
 
-def build_bpf_text(has_bytes_issue: bool, has_bytes_complete: bool, want_latency: bool) -> str:
+def build_bpf_text(has_bytes_issue: bool, has_bytes_complete: bool, want_latency: bool, all_devices: bool) -> str:
     issue_bytes = "args->bytes" if has_bytes_issue else "(args->nr_sector << 9)"
     complete_bytes = "args->bytes" if has_bytes_complete else "(args->nr_sector << 9)"
+    filter_issue = "" if all_devices else """
+    u8 *enabled = filter_devs.lookup(&dev);
+    if (!enabled) return 0;
+"""
+    filter_complete = "" if all_devices else """
+    u8 *enabled = filter_devs.lookup(&dev);
+    if (!enabled) return 0;
+"""
     latency_issue = (
         """
     struct start_key sk = {};
@@ -98,8 +118,7 @@ BPF_HASH(start, struct start_key, struct start_val);
 
 static __always_inline int op_from_rwbs(const char *rwbs)
 {{
-    char c = 0;
-    bpf_probe_read_kernel(&c, sizeof(c), rwbs);
+    char c = rwbs[0];
     if (c == 'R') return 0;
     if (c == 'W') return 1;
     if (c == 'F') return 2;
@@ -150,9 +169,7 @@ static __always_inline void increment_stats(struct stat_key *key, u64 bytes)
 TRACEPOINT_PROBE(block, block_rq_issue)
 {{
     u32 dev = args->dev;
-    u8 *enabled = filter_devs.lookup(&dev);
-    if (!enabled) return 0;
-
+{filter_issue}
     u32 bytes = {issue_bytes};
     u32 op = op_from_rwbs(args->rwbs);
 
@@ -173,8 +190,7 @@ TRACEPOINT_PROBE(block, block_rq_issue)
 TRACEPOINT_PROBE(block, block_rq_complete)
 {{
     u32 dev = args->dev;
-    u8 *enabled = filter_devs.lookup(&dev);
-    if (!enabled) return 0;
+{filter_complete}
 {latency_complete}
     return 0;
 }}
@@ -218,10 +234,19 @@ def delta_hist(now, prev):
     return out
 
 
+def dev_label(dev: int, dev_names: Dict[int, str]) -> str:
+    if dev in dev_names:
+        return dev_names[dev]
+    major = (dev >> 8) & 0xFFF
+    minor = (dev & 0xFF) | ((dev >> 12) & 0xFFF00)
+    return f"dev={dev}({major}:{minor})"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="BCC block tracepoint observer for selected NVMe block devices")
     parser.add_argument("--mode", choices=["host"], default="host", help="observer mode; this script implements host mode")
     parser.add_argument("--devices", required=True, help="comma-separated block devices, e.g. /dev/nvme1n1,/dev/nvme3n1")
+    parser.add_argument("--all-devices", action="store_true", help="debug mode: ignore --devices filter and record all block_rq_issue events")
     parser.add_argument("--interval", type=float, default=1.0, help="print interval in seconds")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON lines")
     parser.add_argument("--hist", action="store_true", help="print log2 IO size histogram")
@@ -250,13 +275,19 @@ def main() -> int:
     complete_fmt = tracepoint_format("block/block_rq_complete")
     has_issue = bool(issue_fmt)
     has_complete = bool(complete_fmt)
-    has_bytes_issue = "field:" in issue_fmt and "bytes" in issue_fmt
-    has_bytes_complete = "field:" in complete_fmt and "bytes" in complete_fmt
+    has_bytes_issue = "bytes" in issue_fmt
+    has_bytes_complete = "bytes" in complete_fmt
     if not has_issue or not has_complete:
         print("warning: block tracepoint format not readable; BCC compile may still work on the target host", file=sys.stderr)
 
     if args.dry_run:
-        print(json_dumps({"devices": list(devs.values()), "has_bytes_issue": has_bytes_issue, "has_bytes_complete": has_bytes_complete}))
+        print(json_dumps({
+            "devices": list(devs.values()),
+            "all_devices": args.all_devices,
+            "has_bytes_issue": has_bytes_issue,
+            "has_bytes_complete": has_bytes_complete,
+            "tracefs": first_existing_tracefs(),
+        }))
         return 0
 
     try:
@@ -265,13 +296,17 @@ def main() -> int:
         print(f"failed to import BCC: {exc}", file=sys.stderr)
         return 2
 
-    b = BPF(text=build_bpf_text(has_bytes_issue, has_bytes_complete, args.latency))
+    b = BPF(text=build_bpf_text(has_bytes_issue, has_bytes_complete, args.latency, args.all_devices))
     one = ct.c_ubyte(1)
     for dev in devs:
         b["filter_devs"][ct.c_uint32(dev)] = one
 
     dev_names = {dev: f"{meta['path']}({meta['major']}:{meta['minor']})" for dev, meta in devs.items()}
-    print(f"observing: {', '.join(dev_names.values())}", file=sys.stderr)
+    if args.all_devices:
+        print("observing: all block devices, device filter disabled", file=sys.stderr)
+        print(f"selected device labels: {', '.join(dev_names.values())}", file=sys.stderr)
+    else:
+        print(f"observing: {', '.join(dev_names.values())}", file=sys.stderr)
 
     stop = False
 
@@ -299,27 +334,29 @@ def main() -> int:
         if args.json:
             rows = []
             for (dev, op), (ios, bytes_) in sorted(d_stats.items()):
-                rows.append({"device": dev_names.get(dev, str(dev)), "op": OP_NAMES.get(op, "other"), "ios": ios, "bytes": bytes_, "avg_size": (bytes_ / ios if ios else 0)})
+                rows.append({"device": dev_label(dev, dev_names), "op": OP_NAMES.get(op, "other"), "ios": ios, "bytes": bytes_, "avg_size": (bytes_ / ios if ios else 0)})
             print(json_dumps({"ts": ts, "interval": args.interval, "stats": rows}))
             continue
         print(time.strftime("%H:%M:%S"))
         for (dev, op), (ios, bytes_) in sorted(d_stats.items()):
             avg = bytes_ / ios if ios else 0
-            print(f"{dev_names.get(dev, str(dev)):>24} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes={bytes_:<12} avg_size={avg:.1f}")
+            print(f"{dev_label(dev, dev_names):>24} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes={bytes_:<12} avg_size={avg:.1f}")
         if args.hist:
-            for dev in sorted(devs):
+            hist_devs = sorted({d for (d, _, _) in d_size}) if args.all_devices else sorted(devs)
+            for dev in hist_devs:
                 for op in range(5):
                     rows = {slot: cnt for (d, o, slot), cnt in d_size.items() if d == dev and o == op}
-                    print_log2_hist(f"size {dev_names[dev]} {OP_NAMES.get(op, 'other')}", rows, "bytes")
+                    print_log2_hist(f"size {dev_label(dev, dev_names)} {OP_NAMES.get(op, 'other')}", rows, "bytes")
         if args.latency:
-            for dev in sorted(devs):
+            lat_devs = sorted({d for (d, _, _) in d_lat}) if args.all_devices else sorted(devs)
+            for dev in lat_devs:
                 for op in range(5):
                     rows = {slot: cnt for (d, o, slot), cnt in d_lat.items() if d == dev and o == op}
-                    print_log2_hist(f"latency {dev_names[dev]} {OP_NAMES.get(op, 'other')}", rows, "usec")
+                    print_log2_hist(f"latency {dev_label(dev, dev_names)} {OP_NAMES.get(op, 'other')}", rows, "usec")
 
     print("summary", file=sys.stderr)
     for (dev, op), (ios, bytes_) in sorted(summary.items()):
-        print(f"{dev_names.get(dev, str(dev))} {OP_NAMES.get(op, 'other')} ios={ios} bytes={bytes_}", file=sys.stderr)
+        print(f"{dev_label(dev, dev_names)} {OP_NAMES.get(op, 'other')} ios={ios} bytes={bytes_}", file=sys.stderr)
     return 0
 
 
