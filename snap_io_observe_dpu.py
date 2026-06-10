@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Observe DPU/SNAP ingress and egress IO sizes with BCC uprobes."""
+"""Observe BlueField DPU/SNAP ingress and egress IO sizes with BCC uprobes.
+
+This observer is intentionally conservative:
+- egress defaults to fixed-buffer SPDK NVMe read/write APIs when available.
+- ingress is not auto-attached from fuzzy symbols unless --auto-ingress-fuzzy is set.
+- latency is only attempted on egress request-pointer submit/completion paths.
+"""
 
 from __future__ import annotations
 
@@ -225,12 +231,13 @@ def build_bpf_text(args, enable_latency: bool) -> str:
     manual_bytes_expr = f"((u64){manual_arg})"
     if args.manual_size_mode == "lba_count":
         manual_bytes_expr = f"((u64){manual_arg}) * {args.lba_size}ULL"
-    latency_submit = """
+
+    latency_start = """
     if (req != 0) {
         struct start_val sv = {};
         sv.ts = bpf_ktime_get_ns();
-        sv.direction = direction;
-        sv.op = op;
+        sv.direction = 1;
+        sv.op = 4;
         starts.update(&req, &sv);
     }
 """
@@ -249,8 +256,9 @@ def build_bpf_text(args, enable_latency: bool) -> str:
     }
 """.replace("REQ_COMPLETE_EXPR", req_complete_arg)
     if not enable_latency:
-        latency_submit = ""
+        latency_start = ""
         latency_complete = ""
+
     return f"""
 #include <uapi/linux/ptrace.h>
 
@@ -323,7 +331,7 @@ static __always_inline void increment_lat_hist(struct hist_key *key)
     }}
 }}
 
-static __always_inline int record_io(struct pt_regs *ctx, u32 direction, u32 op, u32 mode, u64 bytes, u32 has_size, u64 req)
+static __always_inline int record_io(struct pt_regs *ctx, u32 direction, u32 op, u32 mode, u64 bytes, u32 has_size)
 {{
     u32 tid = (u32)bpf_get_current_pid_tgid();
     save_comm(tid);
@@ -356,40 +364,42 @@ static __always_inline int record_io(struct pt_regs *ctx, u32 direction, u32 op,
         hk.slot = bpf_log2l(bytes ? bytes : 1);
         increment_size_hist(&hk);
     }}
-{latency_submit}
     return 0;
 }}
 
 int trace_ingress_pointer(struct pt_regs *ctx)
 {{
-    return record_io(ctx, 0, 4, 0, 0, 0, {req_submit_arg});
+    return record_io(ctx, 0, 4, 0, 0, 0);
 }}
 
 int trace_manual_ingress(struct pt_regs *ctx)
 {{
-    return record_io(ctx, 0, {manual_op}, 4, {manual_bytes_expr}, 1, {req_submit_arg});
+    return record_io(ctx, 0, {manual_op}, 4, {manual_bytes_expr}, 1);
 }}
 
 int trace_egress_read(struct pt_regs *ctx)
 {{
     u64 lba_count = PT_REGS_PARM5(ctx);
-    return record_io(ctx, 1, 0, 2, lba_count * {args.lba_size}ULL, 1, 0);
+    return record_io(ctx, 1, 0, 2, lba_count * {args.lba_size}ULL, 1);
 }}
 
 int trace_egress_write(struct pt_regs *ctx)
 {{
     u64 lba_count = PT_REGS_PARM5(ctx);
-    return record_io(ctx, 1, 1, 2, lba_count * {args.lba_size}ULL, 1, 0);
+    return record_io(ctx, 1, 1, 2, lba_count * {args.lba_size}ULL, 1);
 }}
 
 int trace_egress_request(struct pt_regs *ctx)
 {{
-    return record_io(ctx, 1, 4, 3, 0, 0, {req_submit_arg});
+    u64 req = {req_submit_arg};
+    record_io(ctx, 1, 4, 3, 0, 0);
+{latency_start}
+    return 0;
 }}
 
 int trace_manual_egress(struct pt_regs *ctx)
 {{
-    return record_io(ctx, 1, {manual_op}, 4, {manual_bytes_expr}, 1, {req_submit_arg});
+    return record_io(ctx, 1, {manual_op}, 4, {manual_bytes_expr}, 1);
 }}
 
 int trace_complete(struct pt_regs *ctx)
@@ -429,10 +439,15 @@ def attach_uprobe_compat(b, obj: str, sym: str, fn: str, pid: int) -> None:
         b.attach_uprobe(name=obj, sym=sym, fn_name=fn)
 
 
-def hit_to_dict(hit: Optional[SymbolHit]):
+def hit_to_dict(hit: Optional[SymbolHit], confidence: Optional[str] = None, size_supported: Optional[bool] = None):
     if not hit:
         return None
-    return {"obj": hit.obj, "symbol": hit.symbol, "source": hit.source}
+    out = {"obj": hit.obj, "symbol": hit.symbol, "source": hit.source}
+    if confidence is not None:
+        out["confidence"] = confidence
+    if size_supported is not None:
+        out["size_supported"] = size_supported
+    return out
 
 
 def manual_hit(symbol: Optional[str], obj: Optional[str], objects: Sequence[str]) -> Optional[SymbolHit]:
@@ -448,14 +463,25 @@ def manual_hit(symbol: Optional[str], obj: Optional[str], objects: Sequence[str]
 def choose_symbol_plan(args, objects: Sequence[str], hits: Dict[str, List[SymbolHit]]):
     plan = {
         "ingress": None,
+        "ingress_confidence": None,
         "egress_read": None,
         "egress_write": None,
         "egress_request": None,
         "completion": None,
         "manual_egress": None,
     }
+
     if args.mode in ("ingress", "both"):
-        plan["ingress"] = manual_hit(args.ingress_symbol, args.ingress_object, objects) or (hits["ingress"][0] if hits["ingress"] else None)
+        manual_ingress = manual_hit(args.ingress_symbol, args.ingress_object, objects)
+        if manual_ingress:
+            plan["ingress"] = manual_ingress
+            plan["ingress_confidence"] = "manual"
+        elif args.auto_ingress_fuzzy and hits["ingress"]:
+            plan["ingress"] = hits["ingress"][0]
+            plan["ingress_confidence"] = "fuzzy-low"
+        else:
+            plan["ingress_confidence"] = "disabled"
+
     if args.mode in ("egress", "both"):
         plan["manual_egress"] = manual_hit(args.egress_symbol, args.egress_object, objects)
         if not plan["manual_egress"]:
@@ -465,6 +491,7 @@ def choose_symbol_plan(args, objects: Sequence[str], hits: Dict[str, List[Symbol
                 plan["egress_request"] = choose_first(hits["egress_request"], EGRESS_REQUEST_CANDIDATES)
         if args.latency:
             plan["completion"] = choose_first(hits["completion"], COMPLETE_CANDIDATES)
+
     return plan
 
 
@@ -515,14 +542,15 @@ def parse_args():
     parser.add_argument("--binary", help="path to SNAP/SPDK target executable")
     parser.add_argument("--search-dir", help="directory containing SNAP/SPDK shared libraries or binaries")
     parser.add_argument("--container", help="container name for operator notes only; this script does not run docker exec")
-    parser.add_argument("--mode", choices=["ingress", "egress", "both"], default="both", help="which DPU path to observe")
+    parser.add_argument("--mode", choices=["ingress", "egress", "both"], default="egress", help="which DPU path to observe; default is egress because ingress requires verified SNAP symbols")
     parser.add_argument("--interval", type=float, default=1.0, help="print interval in seconds")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON lines")
     parser.add_argument("--hist", action="store_true", help="print log2 size and latency histograms")
-    parser.add_argument("--latency", action="store_true", help="attempt request-pointer submit/complete latency")
+    parser.add_argument("--latency", action="store_true", help="attempt egress request-pointer submit/complete latency")
     parser.add_argument("--lba-size", type=int, default=512, help="logical block size for fixed-buffer spdk_nvme_ns_cmd_read/write")
     parser.add_argument("--list-symbols", action="store_true", help="list ingress/egress candidate symbols and exit")
     parser.add_argument("--dry-run", action="store_true", help="show selected attach plan without attaching")
+    parser.add_argument("--auto-ingress-fuzzy", action="store_true", help="allow fuzzy ingress auto-attach; unsafe until manually validated")
     parser.add_argument("--ingress-symbol", help="manual ingress symbol")
     parser.add_argument("--ingress-object", help="object path for --ingress-symbol")
     parser.add_argument("--egress-symbol", help="manual egress symbol")
@@ -550,7 +578,7 @@ def main() -> int:
 
     hits = discover_all_candidates(objects)
     if args.list_symbols:
-        print_symbol_group("ingress candidates:", hits["ingress"])
+        print_symbol_group("ingress fuzzy candidates (listing only; not auto-attached unless --auto-ingress-fuzzy is used):", hits["ingress"])
         print_symbol_group("egress fixed-buffer read candidates:", hits["egress_read"])
         print_symbol_group("egress fixed-buffer write candidates:", hits["egress_write"])
         print_symbol_group("egress manual/experimental readv/writev candidates:", hits["egress_manual"])
@@ -565,9 +593,17 @@ def main() -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    if args.mode in ("ingress", "both") and not plan.get("ingress"):
+        print("note: ingress is not attached because no --ingress-symbol was provided and --auto-ingress-fuzzy is not set", file=sys.stderr)
+        print("      run --list-symbols first, then pass a verified --ingress-symbol/--manual-size-arg for meaningful ingress data", file=sys.stderr)
+    if plan.get("ingress_confidence") == "fuzzy-low":
+        print("warning: fuzzy ingress attach selected; treat ingress counts as unverified until the symbol is confirmed to be the SNAP host-command path", file=sys.stderr)
+
     latency_supported = bool(args.latency and plan.get("egress_request") and plan.get("completion"))
     if args.latency and not latency_supported:
         print("warning: latency unsupported because a matching egress request submit and completion symbol were not selected", file=sys.stderr)
+    if args.latency and latency_supported and (plan.get("egress_read") or plan.get("egress_write")):
+        print("note: latency rows use egress-request-pointer mode; size rows use egress-nvme-rw-size mode. Do not sum these modes as one IO count.", file=sys.stderr)
 
     selected = {
         "mode": args.mode,
@@ -577,12 +613,13 @@ def main() -> int:
         "manual_size_arg": args.manual_size_arg,
         "manual_size_mode": args.manual_size_mode,
         "manual_op": args.manual_op,
-        "ingress": hit_to_dict(plan.get("ingress")),
-        "egress_read": hit_to_dict(plan.get("egress_read")),
-        "egress_write": hit_to_dict(plan.get("egress_write")),
-        "egress_request": hit_to_dict(plan.get("egress_request")),
-        "manual_egress": hit_to_dict(plan.get("manual_egress")),
-        "completion": hit_to_dict(plan.get("completion")),
+        "auto_ingress_fuzzy": args.auto_ingress_fuzzy,
+        "ingress": hit_to_dict(plan.get("ingress"), plan.get("ingress_confidence"), bool(args.manual_size_arg and args.ingress_symbol)),
+        "egress_read": hit_to_dict(plan.get("egress_read"), "exact", True),
+        "egress_write": hit_to_dict(plan.get("egress_write"), "exact", True),
+        "egress_request": hit_to_dict(plan.get("egress_request"), "request-pointer", False),
+        "manual_egress": hit_to_dict(plan.get("manual_egress"), "manual", bool(args.manual_size_arg)),
+        "completion": hit_to_dict(plan.get("completion"), "completion", False),
     }
     if args.dry_run:
         print(json_dumps(selected))
@@ -624,7 +661,7 @@ def main() -> int:
         return 2
     if not attached:
         print("error: no attachable symbols selected", file=sys.stderr)
-        print("fallbacks: specify --ingress-symbol/--egress-symbol manually or rebuild SNAP/SPDK with visible noinline symbols", file=sys.stderr)
+        print("fallbacks: for egress, verify spdk_nvme_ns_cmd_read/write are visible; for ingress, specify --ingress-symbol manually or add noinline SNAP wrapper symbols", file=sys.stderr)
         return 2
     print("attached: " + ", ".join(attached), file=sys.stderr)
 
