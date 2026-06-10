@@ -54,32 +54,55 @@ def _block_name_from_identifier(identifier: str) -> str:
     return raw
 
 
-def _sysfs_block_dev_file(identifier: str) -> Optional[str]:
-    """Resolve an iostat-style block name/path to a sysfs dev file.
-
-    iostat/sysstat enumerates block devices from sysfs.  NVMe multipath path
-    devices such as nvme2c2n1 can exist under /sys/class/block even when udev
-    does not create /dev/nvme2c2n1.
-
-    Some NVMe path devices expose major:minor at:
-      /sys/class/block/<name>/device/dev
-    rather than:
-      /sys/class/block/<name>/dev
-    so check both forms.
-    """
-    name = _block_name_from_identifier(identifier)
-    if not name:
+def _major_minor_from_proc_diskstats(name: str) -> Optional[Tuple[int, int]]:
+    """Resolve block major:minor exactly like iostat's diskstats source."""
+    try:
+        with open("/proc/diskstats", "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3 and parts[2] == name:
+                    return int(parts[0]), int(parts[1])
+    except OSError:
         return None
+    return None
 
+
+def _major_minor_from_uevent(name: str) -> Optional[Tuple[int, int]]:
+    for path in [f"/sys/class/block/{name}/uevent", f"/sys/block/{name}/uevent"]:
+        if not os.path.exists(path):
+            continue
+        vals = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if "=" in line:
+                        k, v = line.strip().split("=", 1)
+                        vals[k] = v
+        except OSError:
+            continue
+        if "MAJOR" in vals and "MINOR" in vals:
+            return int(vals["MAJOR"], 0), int(vals["MINOR"], 0)
+    return None
+
+
+def _major_minor_from_sysfs_dev(name: str) -> Optional[Tuple[int, int]]:
+    """Last-resort sysfs fallback.
+
+    Prefer /proc/diskstats and uevent.  Avoid /device/dev for filtering because
+    NVMe path devices may expose the parent controller/device dev there rather
+    than the block layer major:minor used by block tracepoints.
+    """
     candidates = [
         f"/sys/class/block/{name}/dev",
         f"/sys/block/{name}/dev",
-        f"/sys/class/block/{name}/device/dev",
-        f"/sys/block/{name}/device/dev",
     ]
     for path in candidates:
         if os.path.exists(path):
-            return path
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return _parse_major_minor(f.read())
+            except OSError:
+                continue
     return None
 
 
@@ -88,12 +111,17 @@ def linux_dev_key(identifier: str) -> Tuple[int, int, int]:
 
     Accepted identifiers:
     - real block device node: /dev/nvme2n1
-    - sysfs/iostat-style name: nvme2c2n1
+    - iostat/diskstats-style block name: nvme2c2n1
     - sysfs path: /sys/class/block/nvme2c2n1
 
-    The function prefers real device-node stat when available, then falls back
-    to sysfs like iostat.  The returned key is encoded for the observed block
-    tracepoint args->dev format on this host.
+    Resolution order:
+    1. real /dev block-node stat
+    2. /proc/diskstats name match, same source family as iostat
+    3. /sys/class/block/<name>/uevent MAJOR/MINOR
+    4. /sys/class/block/<name>/dev
+
+    The returned key is encoded for the observed block tracepoint args->dev
+    format on this host.
     """
     if os.path.exists(identifier):
         st = os.stat(identifier)
@@ -102,15 +130,16 @@ def linux_dev_key(identifier: str) -> Tuple[int, int, int]:
             minor = os.minor(st.st_rdev)
             return major, minor, linux_block_trace_dev_key(major, minor)
 
-    dev_file = _sysfs_block_dev_file(identifier)
-    if dev_file:
-        with open(dev_file, "r", encoding="utf-8") as f:
-            major, minor = _parse_major_minor(f.read())
-        return major, minor, linux_block_trace_dev_key(major, minor)
+    name = _block_name_from_identifier(identifier)
+    for resolver in (_major_minor_from_proc_diskstats, _major_minor_from_uevent, _major_minor_from_sysfs_dev):
+        mm = resolver(name)
+        if mm is not None:
+            major, minor = mm
+            return major, minor, linux_block_trace_dev_key(major, minor)
 
     if os.path.exists(identifier):
-        raise ValueError(f"{identifier} exists but is not a block device and has no supported sysfs dev file")
-    raise FileNotFoundError(f"block device {identifier!r} not found in /dev or supported sysfs block paths")
+        raise ValueError(f"{identifier} exists but is not a block device and no block major:minor was found")
+    raise FileNotFoundError(f"block device {identifier!r} not found in /dev, /proc/diskstats, or supported sysfs block paths")
 
 
 def log2_bucket_label(slot: int) -> str:
