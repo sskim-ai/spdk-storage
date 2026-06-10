@@ -124,6 +124,12 @@ struct hist_key {{
     u64 slot;
 }};
 
+struct size_count_key {{
+    u32 op;
+    u32 tid;
+    u32 bytes;
+}};
+
 struct start_val {{
     u64 ts;
     u32 op;
@@ -131,8 +137,10 @@ struct start_val {{
 
 BPF_HASH(stats, struct stat_key, struct stat_val);
 BPF_HASH(size_hist, struct hist_key, u64);
+BPF_HASH(size_counts, struct size_count_key, u64);
 BPF_HASH(lat_hist, struct hist_key, u64);
 BPF_HASH(starts, u64, struct start_val);
+
 struct comm_val {{
     char comm[16];
 }};
@@ -155,6 +163,19 @@ static __always_inline void increment_size_hist(struct hist_key *key)
     }} else {{
         size_hist.update(key, &zero);
         val = size_hist.lookup(key);
+        if (val) __sync_fetch_and_add(val, 1);
+    }}
+}}
+
+static __always_inline void increment_size_count(struct size_count_key *key)
+{{
+    u64 zero = 0, *val;
+    val = size_counts.lookup(key);
+    if (val) {{
+        __sync_fetch_and_add(val, 1);
+    }} else {{
+        size_counts.update(key, &zero);
+        val = size_counts.lookup(key);
         if (val) __sync_fetch_and_add(val, 1);
     }}
 }}
@@ -202,6 +223,12 @@ static __always_inline int submit_common(struct pt_regs *ctx, u32 op, u64 bytes,
         hk.tid = tid;
         hk.slot = bpf_log2l(bytes);
         increment_size_hist(&hk);
+
+        struct size_count_key sk = {{}};
+        sk.op = op;
+        sk.tid = tid;
+        sk.bytes = (u32)bytes;
+        increment_size_count(&sk);
     }}
 {latency_submit}
     return 0;
@@ -249,6 +276,10 @@ class HistKey(ct.Structure):
     _fields_ = [("op", ct.c_uint32), ("tid", ct.c_uint32), ("slot", ct.c_uint64)]
 
 
+class SizeCountKey(ct.Structure):
+    _fields_ = [("op", ct.c_uint32), ("tid", ct.c_uint32), ("bytes", ct.c_uint32)]
+
+
 def attach_uprobe_compat(b, obj: str, sym: str, fn: str, pid: int) -> None:
     try:
         b.attach_uprobe(name=obj, sym=sym, fn_name=fn, pid=pid)
@@ -277,7 +308,11 @@ def snapshot_hist(table) -> Dict[Tuple[int, int, int], int]:
     return {(k.op, k.tid, int(k.slot)): int(v.value) for k, v in table.items()}
 
 
-def delta_hist(now, prev):
+def snapshot_size_counts(table) -> Dict[Tuple[int, int, int], int]:
+    return {(k.op, k.tid, int(k.bytes)): int(v.value) for k, v in table.items()}
+
+
+def delta_counts(now, prev):
     return {k: v - prev.get(k, 0) for k, v in now.items() if v - prev.get(k, 0) > 0}
 
 
@@ -341,6 +376,14 @@ def select_submit_hits(args, objects, submit_hits):
     return selected
 
 
+def print_size_counts(title: str, rows: Dict[int, int]) -> None:
+    if not rows:
+        return
+    print(title)
+    for size in sorted(rows):
+        print(f"  size_bytes={size:<12} count={rows[size]}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="BCC uprobe observer for SPDK userspace NVMe/vfio IO paths")
     parser.add_argument("--mode", choices=["spdk"], default="spdk", help="observer mode; this script implements spdk mode")
@@ -350,6 +393,7 @@ def main() -> int:
     parser.add_argument("--interval", type=float, default=1.0, help="print interval in seconds")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON lines")
     parser.add_argument("--hist", action="store_true", help="print log2 size histogram")
+    parser.add_argument("--size-counts", action="store_true", help="print exact IO size byte counts, e.g. 4096 -> count")
     parser.add_argument("--latency", action="store_true", help="attempt pointer-based submit/complete latency")
     parser.add_argument("--symbols-auto-detect", action="store_true", help="deprecated no-op; symbol auto-detection is the default")
     parser.add_argument("--submit-symbol", help="manual submit symbol; attaches to --binary unless symbol is discovered elsewhere")
@@ -404,7 +448,7 @@ def main() -> int:
     zero_byte_fallback = mode in {"pointer-only-no-size", "request-pointer-latency"}
 
     if zero_byte_fallback:
-        print("warning: selected submit path is pointer-only; bytes, avg_size, and size histogram are unsupported for this attach mode", file=sys.stderr)
+        print("warning: selected submit path is pointer-only; bytes, avg_size, size histogram, and size counts are unsupported for this attach mode", file=sys.stderr)
 
     selected = {
         "submit": [h.__dict__ for h in selected_submit_hits],
@@ -415,6 +459,7 @@ def main() -> int:
         "mode": mode,
         "bytes_supported": not zero_byte_fallback,
         "size_hist_supported": not zero_byte_fallback,
+        "size_counts_supported": not zero_byte_fallback,
         "req_submit_arg": args.req_submit_arg,
         "req_complete_arg": args.req_complete_arg,
     }
@@ -464,23 +509,28 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
-    prev_stats, prev_size, prev_lat = {}, {}, {}
+    prev_stats, prev_size_hist, prev_size_counts, prev_lat = {}, {}, {}, {}
     summary: Dict[Tuple[int, int], Tuple[int, int]] = {}
+    summary_size_counts: Dict[Tuple[int, int, int], int] = {}
 
     while not stop:
         time.sleep(args.interval)
         names = thread_names(b["thread_names"])
         now_stats = snapshot_hash(b["stats"])
-        now_size = snapshot_hist(b["size_hist"])
+        now_size_hist = snapshot_hist(b["size_hist"])
+        now_size_counts = snapshot_size_counts(b["size_counts"])
         now_lat = snapshot_hist(b["lat_hist"])
         d_stats = delta_stats(now_stats, prev_stats)
-        d_size = delta_hist(now_size, prev_size)
-        d_lat = delta_hist(now_lat, prev_lat)
-        prev_stats, prev_size, prev_lat = now_stats, now_size, now_lat
+        d_size_hist = delta_counts(now_size_hist, prev_size_hist)
+        d_size_counts = delta_counts(now_size_counts, prev_size_counts)
+        d_lat = delta_counts(now_lat, prev_lat)
+        prev_stats, prev_size_hist, prev_size_counts, prev_lat = now_stats, now_size_hist, now_size_counts, now_lat
 
         for key, val in d_stats.items():
             old = summary.get(key, (0, 0))
             summary[key] = (old[0] + val[0], old[1] + val[1])
+        for key, val in d_size_counts.items():
+            summary_size_counts[key] = summary_size_counts.get(key, 0) + val
 
         if args.json:
             rows = []
@@ -491,7 +541,11 @@ def main() -> int:
                 else:
                     row.update({"bytes": None, "avg_size": None})
                 rows.append(row)
-            print(json_dumps({"ts": time.time(), "interval": args.interval, "stats": rows, "mode": mode, "latency_supported": latency_supported}))
+            size_rows = []
+            if not zero_byte_fallback:
+                for (op, tid, size), count in sorted(d_size_counts.items()):
+                    size_rows.append({"op": OP_NAMES.get(op, "other"), "tid": tid, "thread": names.get(tid, ""), "size_bytes": size, "count": count})
+            print(json_dumps({"ts": time.time(), "interval": args.interval, "stats": rows, "size_counts": size_rows, "mode": mode, "latency_supported": latency_supported}))
             continue
 
         print(time.strftime("%H:%M:%S"))
@@ -503,11 +557,18 @@ def main() -> int:
                 print(f"tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes={bytes_:<12} avg_size={avg:.1f}")
 
         if args.hist and not zero_byte_fallback:
-            for (op, tid) in sorted({(op, tid) for op, tid, _ in d_size}):
-                rows = {slot: cnt for (o, t, slot), cnt in d_size.items() if o == op and t == tid}
-                print_log2_hist(f"size tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows, "bytes")
+            for (op, tid) in sorted({(op, tid) for op, tid, _ in d_size_hist}):
+                rows = {slot: cnt for (o, t, slot), cnt in d_size_hist.items() if o == op and t == tid}
+                print_log2_hist(f"size_hist tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows, "bytes")
         elif args.hist and zero_byte_fallback:
             print("size histogram unsupported for pointer-only attach mode")
+
+        if args.size_counts and not zero_byte_fallback:
+            for (op, tid) in sorted({(op, tid) for op, tid, _ in d_size_counts}):
+                rows = {size: cnt for (o, t, size), cnt in d_size_counts.items() if o == op and t == tid}
+                print_size_counts(f"size_counts tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows)
+        elif args.size_counts and zero_byte_fallback:
+            print("size counts unsupported for pointer-only attach mode")
 
         if latency_supported:
             for (op, tid) in sorted({(op, tid) for op, tid, _ in d_lat}):
@@ -520,6 +581,10 @@ def main() -> int:
             print(f"tid={tid} {OP_NAMES.get(op, 'other')} ios={ios} bytes=unsupported", file=sys.stderr)
         else:
             print(f"tid={tid} {OP_NAMES.get(op, 'other')} ios={ios} bytes={bytes_}", file=sys.stderr)
+    if args.size_counts and not zero_byte_fallback:
+        print("summary_size_counts", file=sys.stderr)
+        for (op, tid, size), count in sorted(summary_size_counts.items()):
+            print(f"tid={tid} {OP_NAMES.get(op, 'other')} size_bytes={size} count={count}", file=sys.stderr)
     return 0
 
 
