@@ -1,8 +1,8 @@
 # spdk-storage
 
-BCC/eBPF observers for a BlueField/SNAP NVMe-oF deployment where the GPU host sees emulated NVMe block devices, but the storage server drives physical NVMe SSDs from SPDK through `vfio-pci`.
+BCC/eBPF observers for a BlueField/SNAP NVMe-oF deployment where the GPU host sees emulated NVMe block devices, the DPU/SNAP path forwards NVMe-oF traffic, and the storage server drives physical NVMe SSDs from SPDK through `vfio-pci`.
 
-## Why two observers exist
+## Why separate observers exist
 
 `bcc/tools/bitesize.py` watches Linux block-layer tracepoints. That is useful on the GPU host because `/dev/nvme1n1` and `/dev/nvme3n1` are Linux block devices exposed by BF3/SNAP. It is not sufficient on the storage server because SPDK owns the physical NVMe controller through `vfio-pci`; real SSD IO bypasses the kernel block layer, so `block:block_rq_issue` and `iostat` can legitimately show nothing.
 
@@ -15,7 +15,7 @@ GPU host
 
 DPU / fabric
   SNAP / NVMe-oF path
-       interpret separately from host block latency
+       observe: SNAP/SPDK userspace uprobes for ingress and egress
 
 Storage server
   SPDK nvmf_tgt/spdk_tgt
@@ -28,6 +28,7 @@ Storage server
 ## Files
 
 - `nvme_io_observe_host.py`: GPU host observer for selected Linux block devices.
+- `snap_io_observe_dpu.py`: BlueField DPU/SNAP observer for host-command ingress and NVMe-oF egress.
 - `spdk_io_observe_uprobe.py`: storage server observer for SPDK userspace submit/completion symbols.
 - `common.py`: shared histogram, device, diagnostics, and symbol discovery helpers.
 - `examples/`: shell examples for common runs.
@@ -137,6 +138,120 @@ sudo ./spdk_io_observe_uprobe.py \
 
 Use `--submit-object` or `--complete-object` when a manual symbol lives in a shared library instead of `--binary`. The request pointer argument positions are SPDK-build and symbol dependent, so verify the prototype before relying on latency data.
 
+## DPU/SNAP Observer
+
+`snap_io_observe_dpu.py` runs inside the BlueField DPU environment or inside the SNAP container where the target process and libraries are visible. It separates the two DPU-side layers:
+
+```text
+GPU Host
+  app/fio
+    -> Linux block layer
+    -> host NVMe driver
+    -> BF3/SNAP emulated NVMe
+DPU/SNAP
+  ingress: host NVMe command received by SNAP
+    -> SNAP/NVMe-oF initiator path
+  egress: NVMe-oF/RDMA request sent toward storage
+Storage server
+  SPDK NVMe-oF target
+    -> SPDK NVMe driver
+    -> physical NVMe SSD
+```
+
+Basic run:
+
+```bash
+sudo ./snap_io_observe_dpu.py \
+  --pid $(pidof <snap_process>) \
+  --binary /path/to/snap_binary \
+  --search-dir /path/to/snap/libs \
+  --mode both \
+  --interval 1 \
+  --hist
+```
+
+Symbol discovery:
+
+```bash
+sudo ./snap_io_observe_dpu.py \
+  --pid $(pidof <snap_process>) \
+  --binary /path/to/snap_binary \
+  --search-dir /path/to/snap/libs \
+  --list-symbols
+```
+
+Dry-run the selected attach plan:
+
+```bash
+sudo ./snap_io_observe_dpu.py \
+  --pid $(pidof <snap_process>) \
+  --binary /path/to/snap_binary \
+  --search-dir /path/to/snap/libs \
+  --mode both \
+  --dry-run
+```
+
+Start with egress first. This is the most reliable size path because fixed-buffer SPDK NVMe initiator APIs expose `lba_count`:
+
+```bash
+sudo ./snap_io_observe_dpu.py \
+  --pid $(pidof <snap_process>) \
+  --binary /path/to/snap_binary \
+  --search-dir /path/to/snap/libs \
+  --mode egress \
+  --lba-size 512 \
+  --hist
+```
+
+Ingress size usually needs a known SNAP command-processing symbol and argument. Without that, ingress is pointer-only and reports bytes as `unsupported` or JSON `null`:
+
+```bash
+sudo ./snap_io_observe_dpu.py \
+  --pid $(pidof <snap_process>) \
+  --binary /path/to/snap_binary \
+  --search-dir /path/to/snap/libs \
+  --mode ingress \
+  --ingress-symbol <symbol> \
+  --manual-size-arg 5 \
+  --manual-size-mode lba_count \
+  --manual-op read \
+  --hist
+```
+
+Manual egress symbol example:
+
+```bash
+sudo ./snap_io_observe_dpu.py \
+  --pid $(pidof <snap_process>) \
+  --binary /path/to/snap_binary \
+  --search-dir /path/to/snap/libs \
+  --mode egress \
+  --egress-symbol <symbol> \
+  --egress-object /path/to/lib_or_binary \
+  --manual-size-arg 5 \
+  --manual-size-mode lba_count \
+  --manual-op write
+```
+
+DPU container path discovery examples:
+
+```bash
+docker ps
+docker exec -it <snap_container> bash
+ps aux
+find / -type f -perm -111 2>/dev/null | grep -Ei 'snap|spdk|nvmf|nvme'
+find / -type f -name '*.so*' 2>/dev/null | grep -Ei 'snap|spdk|nvme|nvmf'
+```
+
+The DPU observer requires Python 3, BCC Python bindings, root or equivalent BPF/perf privileges, tracefs/debugfs, and kernel headers in the DPU/container environment where it runs. `--container` is only an operator note; the script does not force `docker exec` because path namespaces differ by deployment.
+
+Interpretation:
+
+- If GPU Host block size and DPU ingress size differ, reshaping may be happening in the host NVMe driver, PCIe emulation, or SNAP receive path.
+- If DPU ingress and DPU egress differ, SNAP/NVMe-oF initiator split/merge/re-chunking may be happening.
+- If DPU egress and Storage SPDK physical submit differ, the storage target, bdev, or NVMe layer may be splitting or merging requests.
+- These layers measure different events and should not be treated as identical latency or media-size points.
+
 ## Symbol Discovery
 
 The SPDK observer scans the target executable and `.so` files below `--spdk-build-dir` using available tools:
@@ -197,9 +312,22 @@ This implementation deliberately avoids hardcoded SPDK struct offsets. It provid
 ## Limitations
 
 - SPDK internal functions can be inline/static or stripped, making uprobes impossible.
+- SNAP binaries may be stripped, statically linked, inlined, or proprietary with no public hot-path symbols.
 - Function-boundary uprobes add overhead on very hot poll-mode IO paths.
 - Per-IO latency is reliable only when submit and completion expose the same object pointer.
 - Request pointer argument positions are build/symbol dependent; use `--req-submit-arg` and `--req-complete-arg` only after checking the selected SPDK function prototypes.
 - readv/writev byte accounting is intentionally not automatic because incorrect argument assumptions can silently produce invalid histograms.
+- DPU ingress size is often pointer-only unless a known SNAP symbol and size/lba_count argument are supplied manually.
+- DPU egress size is most reliable when attaching to fixed-buffer `spdk_nvme_ns_cmd_read/write`; `readv/writev` are listed as manual/experimental and are not used for automatic size accounting.
 - Host block latency, DPU/SNAP emulation latency, NVMe-oF network latency, SPDK queueing, and physical SSD media latency are different layers and must be interpreted separately.
 - The host latency key can collide for repeated same-sector IO at high queue depth because portable block tracepoints do not expose a request pointer on all kernels.
+
+## End-to-End Validation Order
+
+1. On the DPU, identify the SNAP container/process.
+2. Run `snap_io_observe_dpu.py --list-symbols`.
+3. Run `snap_io_observe_dpu.py --dry-run` and inspect selected attach points.
+4. Start with `--mode egress` and verify `spdk_nvme_ns_cmd_read/write` count and size histograms.
+5. Add ingress only after choosing a reasonable SNAP symbol; expect pointer-only counts unless manual size arguments are known.
+6. Run the GPU Host observer, DPU observer, and Storage SPDK observer during the same fio workload.
+7. Compare histograms in this order: GPU Host block issue size, DPU/SNAP ingress size, DPU/SNAP egress size, Storage SPDK physical NVMe submit size.

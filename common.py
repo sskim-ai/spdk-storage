@@ -125,6 +125,41 @@ def symbols_from_object(path: str) -> Dict[str, str]:
     return symbols
 
 
+def broad_symbols_from_object(path: str, keywords: Sequence[str]) -> Dict[str, str]:
+    """Return symbols containing any keyword.
+
+    This is intentionally broader than symbols_from_object() for SNAP/DPU
+    environments where proprietary symbols may not use SPDK-style prefixes.
+    """
+    lowered = [k.lower() for k in keywords]
+    symbols: Dict[str, str] = {}
+    commands = [
+        ("nm-D", ["nm", "-D", path]),
+        ("nm", ["nm", "-an", path]),
+        ("readelf", ["readelf", "-Ws", path]),
+        ("objdump", ["objdump", "-t", path]),
+    ]
+    for source, cmd in commands:
+        if shutil.which(cmd[0]) is None:
+            continue
+        text = run_tool(cmd)
+        for line in text.splitlines():
+            for token in line.replace("\t", " ").split():
+                sym = token.split("@@")[0].split("@")[0]
+                low = sym.lower()
+                if any(k in low for k in lowered):
+                    symbols.setdefault(sym, source)
+    return symbols
+
+
+def discover_symbols_fuzzy(objects: Iterable[str], keywords: Sequence[str]) -> List[SymbolHit]:
+    hits: List[SymbolHit] = []
+    for obj in objects:
+        for sym, source in broad_symbols_from_object(obj, keywords).items():
+            hits.append(SymbolHit(obj=obj, symbol=sym, source=source))
+    return hits
+
+
 def discover_symbols(objects: Iterable[str], candidates: Sequence[str]) -> List[SymbolHit]:
     hits: List[SymbolHit] = []
     for obj in objects:
