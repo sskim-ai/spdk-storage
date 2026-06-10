@@ -14,12 +14,18 @@ The verified argument/layout from the active snap_service binary is:
   req        = *(uint64_t *)(zc_ctx + 0x40)
   size_bytes = *(uint64_t *)(req + 0xd0)
 
-Interpretation rule
+Classification rule
 -------------------
-When a write-only fio workload is running, zc_read_done may also increment.
-Treat that as write-induced internal read / read amplification, not as host
-read IO. Run with --workload write to label zc_read_done as
-internal_read_during_write.
+The observer always attaches to both RDMA-ZC done symbols and collects all sizes.
+Per reporting interval, it classifies rows into three categories:
+
+  read                         zc_read_done when no zc_write_done happened
+  write                        zc_write_done
+  internal_read_during_write   zc_read_done in an interval that also has writes
+
+For intentionally mixed read+write workloads, zc_read_done cannot be separated
+into host reads versus write-induced internal reads with this symbol set alone.
+Such intervals are conservatively labeled internal_read_during_write.
 """
 
 from __future__ import annotations
@@ -68,7 +74,7 @@ def arg_expr(n: int) -> str:
     }.get(n, "PT_REGS_PARM3(ctx)")
 
 
-def build_bpf_text(args, read_op: int) -> str:
+def build_bpf_text(args) -> str:
     zc_ctx_expr = arg_expr(args.zc_ctx_arg)
     return f"""
 #include <uapi/linux/ptrace.h>
@@ -197,7 +203,7 @@ static __always_inline int record_io(struct pt_regs *ctx, u32 op)
 
 int trace_zc_read_done(struct pt_regs *ctx)
 {{
-    return record_io(ctx, {read_op});
+    return record_io(ctx, {OP_READ});
 }}
 
 int trace_zc_write_done(struct pt_regs *ctx)
@@ -287,6 +293,33 @@ def print_size_counts(title: str, rows: Dict[int, int]) -> None:
         print(f"  size_bytes={size:<12} count={rows[size]}")
 
 
+def interval_has_write(d_stats: Dict[Tuple[int, int, int, int], Tuple[int, int, int]]) -> bool:
+    return any(op == OP_WRITE and vals[0] > 0 for (_direction, op, _tid, _mode), vals in d_stats.items())
+
+
+def relabel_read_op(op: int, has_write: bool) -> int:
+    if op == OP_READ and has_write:
+        return OP_INTERNAL_READ_DURING_WRITE
+    return op
+
+
+def relabel_stats(d_stats: Dict[Tuple[int, int, int, int], Tuple[int, int, int]], has_write: bool):
+    out: Dict[Tuple[int, int, int, int], Tuple[int, int, int]] = {}
+    for (direction, op, tid, mode), vals in d_stats.items():
+        new_key = (direction, relabel_read_op(op, has_write), tid, mode)
+        old = out.get(new_key, (0, 0, 0))
+        out[new_key] = tuple(old[i] + vals[i] for i in range(3))
+    return out
+
+
+def relabel_counts(d_counts: Dict[Tuple[int, int, int, int], int], has_write: bool):
+    out: Dict[Tuple[int, int, int, int], int] = {}
+    for (direction, op, tid, last), value in d_counts.items():
+        new_key = (direction, relabel_read_op(op, has_write), tid, last)
+        out[new_key] = out.get(new_key, 0) + value
+    return out
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="BCC uprobe observer for validated BlueField DPU/SNAP RDMA-ZC IO sizes")
     parser.add_argument("--pid", type=int, help="snap_service host pid; limits uprobes when supported by BCC")
@@ -295,7 +328,6 @@ def parse_args():
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON lines")
     parser.add_argument("--hist", action="store_true", help="print log2 size histogram")
     parser.add_argument("--size-counts", action="store_true", help="print exact IO size byte counts")
-    parser.add_argument("--workload", choices=["read", "write", "mixed"], default="mixed", help="label read-side RDMA-ZC completions; with write they become internal_read_during_write")
     parser.add_argument("--zc-ctx-arg", type=int, default=3, choices=[1, 2, 3, 4, 5, 6], help="C argument index containing RDMA-ZC context; verified default 3 equals bpftrace arg2")
     parser.add_argument("--zc-ctx-req-offset", type=parse_int_auto, default=0x40, help="offset from RDMA-ZC context to original request pointer; default 0x40")
     parser.add_argument("--req-size-offset", type=parse_int_auto, default=0xD0, help="offset from original request to byte size; default 0xd0")
@@ -310,7 +342,6 @@ def main() -> int:
     for msg in diagnostics():
         print(f"diagnostic: {msg}", file=sys.stderr)
 
-    read_op = OP_INTERNAL_READ_DURING_WRITE if args.workload == "write" else OP_READ
     selected = {
         "mode": "dpu-snap-rdma-zc-done",
         "pid": args.pid,
@@ -319,15 +350,13 @@ def main() -> int:
             READ_SYMBOL: "trace_zc_read_done",
             WRITE_SYMBOL: "trace_zc_write_done",
         },
-        "workload": args.workload,
-        "read_symbol_op": OP_NAMES[read_op],
-        "write_symbol_op": OP_NAMES[OP_WRITE],
+        "categories": [OP_NAMES[OP_READ], OP_NAMES[OP_WRITE], OP_NAMES[OP_INTERNAL_READ_DURING_WRITE]],
+        "classification": "zc_read_done is reported as read in intervals without writes, and internal_read_during_write in intervals with zc_write_done activity.",
         "layout": {
             "zc_ctx_arg": args.zc_ctx_arg,
             "zc_ctx_req_offset": args.zc_ctx_req_offset,
             "req_size_offset": args.req_size_offset,
         },
-        "note": "When --workload write, zc_read_done is labeled internal_read_during_write and should not be counted as host read IO.",
     }
     if args.dry_run:
         print(json_dumps(selected))
@@ -339,7 +368,7 @@ def main() -> int:
         print(f"failed to import BCC: {exc}", file=sys.stderr)
         return 2
 
-    b = BPF(text=build_bpf_text(args, read_op))
+    b = BPF(text=build_bpf_text(args))
     pid = args.pid if args.pid is not None else -1
     attached = []
     try:
@@ -354,8 +383,7 @@ def main() -> int:
 
     print("attached: " + ", ".join(attached), file=sys.stderr)
     print("mode=dpu-snap-rdma-zc-done bytes_supported=True", file=sys.stderr)
-    if args.workload == "write":
-        print("note: zc_read_done is labeled internal_read_during_write for this write workload", file=sys.stderr)
+    print("classification: read intervals -> read; intervals with writes -> zc_read_done is internal_read_during_write", file=sys.stderr)
 
     stop = False
 
@@ -376,10 +404,16 @@ def main() -> int:
         now_stats = snapshot_stats(b["stats"])
         now_hist = snapshot_hist(b["size_hist"])
         now_size_counts = snapshot_size_counts(b["size_counts"])
-        d_stats = delta_stats(now_stats, prev_stats)
-        d_hist = delta_counts(now_hist, prev_hist)
-        d_size_counts = delta_counts(now_size_counts, prev_size_counts)
+
+        raw_d_stats = delta_stats(now_stats, prev_stats)
+        raw_d_hist = delta_counts(now_hist, prev_hist)
+        raw_d_size_counts = delta_counts(now_size_counts, prev_size_counts)
         prev_stats, prev_hist, prev_size_counts = now_stats, now_hist, now_size_counts
+
+        has_write = interval_has_write(raw_d_stats)
+        d_stats = relabel_stats(raw_d_stats, has_write)
+        d_hist = relabel_counts(raw_d_hist, has_write)
+        d_size_counts = relabel_counts(raw_d_size_counts, has_write)
 
         for key, val in d_stats.items():
             old = summary_stats.get(key, (0, 0, 0))
