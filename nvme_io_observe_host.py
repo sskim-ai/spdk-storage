@@ -99,6 +99,12 @@ struct hist_key {{
     u64 slot;
 }};
 
+struct size_count_key {{
+    u32 dev;
+    u32 op;
+    u32 bytes;
+}};
+
 struct start_key {{
     u32 dev;
     u64 sector;
@@ -113,6 +119,7 @@ struct start_val {{
 BPF_HASH(filter_devs, u32, u8);
 BPF_HASH(stats, struct stat_key, struct stat_val);
 BPF_HASH(size_hist, struct hist_key, u64);
+BPF_HASH(size_counts, struct size_count_key, u64);
 BPF_HASH(lat_hist, struct hist_key, u64);
 BPF_HASH(start, struct start_key, struct start_val);
 
@@ -135,6 +142,19 @@ static __always_inline void increment_size_hist(struct hist_key *key)
     }} else {{
         size_hist.update(key, &zero);
         val = size_hist.lookup(key);
+        if (val) __sync_fetch_and_add(val, 1);
+    }}
+}}
+
+static __always_inline void increment_size_count(struct size_count_key *key)
+{{
+    u64 zero = 0, *val;
+    val = size_counts.lookup(key);
+    if (val) {{
+        __sync_fetch_and_add(val, 1);
+    }} else {{
+        size_counts.update(key, &zero);
+        val = size_counts.lookup(key);
         if (val) __sync_fetch_and_add(val, 1);
     }}
 }}
@@ -183,6 +203,12 @@ TRACEPOINT_PROBE(block, block_rq_issue)
     hk.op = op;
     hk.slot = bpf_log2l(bytes ? bytes : 1);
     increment_size_hist(&hk);
+
+    struct size_count_key skey = {{}};
+    skey.dev = dev;
+    skey.op = op;
+    skey.bytes = bytes;
+    increment_size_count(&skey);
 {latency_issue}
     return 0;
 }}
@@ -209,6 +235,10 @@ class HistKey(ct.Structure):
     _fields_ = [("dev", ct.c_uint32), ("op", ct.c_uint32), ("slot", ct.c_uint64)]
 
 
+class SizeCountKey(ct.Structure):
+    _fields_ = [("dev", ct.c_uint32), ("op", ct.c_uint32), ("bytes", ct.c_uint32)]
+
+
 def snapshot_hash(table) -> Dict[Tuple[int, int], Tuple[int, int]]:
     return {(k.dev, k.op): (v.ios, v.bytes) for k, v in table.items()}
 
@@ -225,7 +255,11 @@ def snapshot_hist(table) -> Dict[Tuple[int, int, int], int]:
     return {(k.dev, k.op, int(k.slot)): int(v.value) for k, v in table.items()}
 
 
-def delta_hist(now, prev):
+def snapshot_size_counts(table) -> Dict[Tuple[int, int, int], int]:
+    return {(k.dev, k.op, int(k.bytes)): int(v.value) for k, v in table.items()}
+
+
+def delta_counts(now, prev):
     out = {}
     for key, val in now.items():
         d = val - prev.get(key, 0)
@@ -237,19 +271,28 @@ def delta_hist(now, prev):
 def dev_label(dev: int, dev_names: Dict[int, str]) -> str:
     if dev in dev_names:
         return dev_names[dev]
-    major = (dev >> 8) & 0xFFF
-    minor = (dev & 0xFF) | ((dev >> 12) & 0xFFF00)
+    major = dev >> 20
+    minor = dev & ((1 << 20) - 1)
     return f"dev={dev}({major}:{minor})"
+
+
+def print_size_counts(title: str, rows: Dict[int, int]) -> None:
+    if not rows:
+        return
+    print(title)
+    for size in sorted(rows):
+        print(f"  size_bytes={size:<12} count={rows[size]}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="BCC block tracepoint observer for selected NVMe block devices")
     parser.add_argument("--mode", choices=["host"], default="host", help="observer mode; this script implements host mode")
-    parser.add_argument("--devices", required=True, help="comma-separated block devices, e.g. /dev/nvme1n1,/dev/nvme3n1")
+    parser.add_argument("--devices", required=True, help="comma-separated block devices or diskstats names, e.g. /dev/nvme1n1,nvme2c2n1")
     parser.add_argument("--all-devices", action="store_true", help="debug mode: ignore --devices filter and record all block_rq_issue events")
     parser.add_argument("--interval", type=float, default=1.0, help="print interval in seconds")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON lines")
     parser.add_argument("--hist", action="store_true", help="print log2 IO size histogram")
+    parser.add_argument("--size-counts", action="store_true", help="print exact IO size byte counts, e.g. 4096 -> count")
     parser.add_argument("--latency", action="store_true", help="track issue-to-complete latency histogram")
     parser.add_argument("--dry-run", action="store_true", help="validate devices and generated tracepoint assumptions without attaching")
     args = parser.parse_args()
@@ -316,37 +359,53 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
-    prev_stats, prev_size, prev_lat = {}, {}, {}
+    prev_stats, prev_size_hist, prev_size_counts, prev_lat = {}, {}, {}, {}
     summary: Dict[Tuple[int, int], Tuple[int, int]] = {}
+    summary_size_counts: Dict[Tuple[int, int, int], int] = {}
     while not stop:
         time.sleep(args.interval)
         now_stats = snapshot_hash(b["stats"])
-        now_size = snapshot_hist(b["size_hist"])
+        now_size_hist = snapshot_hist(b["size_hist"])
+        now_size_counts = snapshot_size_counts(b["size_counts"])
         now_lat = snapshot_hist(b["lat_hist"])
         d_stats = delta_stats(now_stats, prev_stats)
-        d_size = delta_hist(now_size, prev_size)
-        d_lat = delta_hist(now_lat, prev_lat)
-        prev_stats, prev_size, prev_lat = now_stats, now_size, now_lat
+        d_size_hist = delta_counts(now_size_hist, prev_size_hist)
+        d_size_counts = delta_counts(now_size_counts, prev_size_counts)
+        d_lat = delta_counts(now_lat, prev_lat)
+        prev_stats, prev_size_hist, prev_size_counts, prev_lat = now_stats, now_size_hist, now_size_counts, now_lat
         ts = time.time()
         for key, val in d_stats.items():
             old = summary.get(key, (0, 0))
             summary[key] = (old[0] + val[0], old[1] + val[1])
+        for key, val in d_size_counts.items():
+            summary_size_counts[key] = summary_size_counts.get(key, 0) + val
+
         if args.json:
-            rows = []
+            stat_rows = []
             for (dev, op), (ios, bytes_) in sorted(d_stats.items()):
-                rows.append({"device": dev_label(dev, dev_names), "op": OP_NAMES.get(op, "other"), "ios": ios, "bytes": bytes_, "avg_size": (bytes_ / ios if ios else 0)})
-            print(json_dumps({"ts": ts, "interval": args.interval, "stats": rows}))
+                stat_rows.append({"device": dev_label(dev, dev_names), "op": OP_NAMES.get(op, "other"), "ios": ios, "bytes": bytes_, "avg_size": (bytes_ / ios if ios else 0)})
+            size_rows = []
+            for (dev, op, size), count in sorted(d_size_counts.items()):
+                size_rows.append({"device": dev_label(dev, dev_names), "op": OP_NAMES.get(op, "other"), "size_bytes": size, "count": count})
+            print(json_dumps({"ts": ts, "interval": args.interval, "stats": stat_rows, "size_counts": size_rows}))
             continue
+
         print(time.strftime("%H:%M:%S"))
         for (dev, op), (ios, bytes_) in sorted(d_stats.items()):
             avg = bytes_ / ios if ios else 0
             print(f"{dev_label(dev, dev_names):>24} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes={bytes_:<12} avg_size={avg:.1f}")
         if args.hist:
-            hist_devs = sorted({d for (d, _, _) in d_size}) if args.all_devices else sorted(devs)
+            hist_devs = sorted({d for (d, _, _) in d_size_hist}) if args.all_devices else sorted(devs)
             for dev in hist_devs:
                 for op in range(5):
-                    rows = {slot: cnt for (d, o, slot), cnt in d_size.items() if d == dev and o == op}
-                    print_log2_hist(f"size {dev_label(dev, dev_names)} {OP_NAMES.get(op, 'other')}", rows, "bytes")
+                    rows = {slot: cnt for (d, o, slot), cnt in d_size_hist.items() if d == dev and o == op}
+                    print_log2_hist(f"size_hist {dev_label(dev, dev_names)} {OP_NAMES.get(op, 'other')}", rows, "bytes")
+        if args.size_counts:
+            count_devs = sorted({d for (d, _, _) in d_size_counts}) if args.all_devices else sorted(devs)
+            for dev in count_devs:
+                for op in range(5):
+                    rows = {size: cnt for (d, o, size), cnt in d_size_counts.items() if d == dev and o == op}
+                    print_size_counts(f"size_counts {dev_label(dev, dev_names)} {OP_NAMES.get(op, 'other')}", rows)
         if args.latency:
             lat_devs = sorted({d for (d, _, _) in d_lat}) if args.all_devices else sorted(devs)
             for dev in lat_devs:
@@ -357,6 +416,10 @@ def main() -> int:
     print("summary", file=sys.stderr)
     for (dev, op), (ios, bytes_) in sorted(summary.items()):
         print(f"{dev_label(dev, dev_names)} {OP_NAMES.get(op, 'other')} ios={ios} bytes={bytes_}", file=sys.stderr)
+    if args.size_counts:
+        print("summary_size_counts", file=sys.stderr)
+        for (dev, op, size), count in sorted(summary_size_counts.items()):
+            print(f"{dev_label(dev, dev_names)} {OP_NAMES.get(op, 'other')} size_bytes={size} count={count}", file=sys.stderr)
     return 0
 
 
