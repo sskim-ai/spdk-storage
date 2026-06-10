@@ -43,29 +43,39 @@ def _parse_major_minor(text: str) -> Tuple[int, int]:
     return int(major_s, 0), int(minor_s, 0)
 
 
+def _block_name_from_identifier(identifier: str) -> str:
+    raw = identifier.strip()
+    if raw.startswith("/sys/class/block/"):
+        return os.path.basename(raw.rstrip("/"))
+    if raw.startswith("/sys/block/"):
+        return os.path.basename(raw.rstrip("/"))
+    if raw.startswith("/dev/"):
+        return os.path.basename(raw)
+    return raw
+
+
 def _sysfs_block_dev_file(identifier: str) -> Optional[str]:
     """Resolve an iostat-style block name/path to a sysfs dev file.
 
     iostat/sysstat enumerates block devices from sysfs.  NVMe multipath path
     devices such as nvme2c2n1 can exist under /sys/class/block even when udev
-    does not create /dev/nvme2c2n1.  This resolver lets tracepoint filters use
-    the same naming source as iostat while still measuring bytes via BPF.
+    does not create /dev/nvme2c2n1.
+
+    Some NVMe path devices expose major:minor at:
+      /sys/class/block/<name>/device/dev
+    rather than:
+      /sys/class/block/<name>/dev
+    so check both forms.
     """
-    raw = identifier.strip()
-    if not raw:
+    name = _block_name_from_identifier(identifier)
+    if not name:
         return None
-    if raw.startswith("/sys/class/block/"):
-        name = os.path.basename(raw.rstrip("/"))
-    elif raw.startswith("/sys/block/"):
-        name = os.path.basename(raw.rstrip("/"))
-    elif raw.startswith("/dev/"):
-        name = os.path.basename(raw)
-    else:
-        name = raw
 
     candidates = [
         f"/sys/class/block/{name}/dev",
         f"/sys/block/{name}/dev",
+        f"/sys/class/block/{name}/device/dev",
+        f"/sys/block/{name}/device/dev",
     ]
     for path in candidates:
         if os.path.exists(path):
@@ -82,8 +92,8 @@ def linux_dev_key(identifier: str) -> Tuple[int, int, int]:
     - sysfs path: /sys/class/block/nvme2c2n1
 
     The function prefers real device-node stat when available, then falls back
-    to /sys/class/block/<name>/dev like iostat.  The returned key is encoded for
-    the observed block tracepoint args->dev format on this host.
+    to sysfs like iostat.  The returned key is encoded for the observed block
+    tracepoint args->dev format on this host.
     """
     if os.path.exists(identifier):
         st = os.stat(identifier)
@@ -94,12 +104,13 @@ def linux_dev_key(identifier: str) -> Tuple[int, int, int]:
 
     dev_file = _sysfs_block_dev_file(identifier)
     if dev_file:
-        major, minor = _parse_major_minor(open(dev_file, "r", encoding="utf-8").read())
+        with open(dev_file, "r", encoding="utf-8") as f:
+            major, minor = _parse_major_minor(f.read())
         return major, minor, linux_block_trace_dev_key(major, minor)
 
     if os.path.exists(identifier):
-        raise ValueError(f"{identifier} exists but is not a block device and has no sysfs block dev file")
-    raise FileNotFoundError(f"block device {identifier!r} not found in /dev or /sys/class/block")
+        raise ValueError(f"{identifier} exists but is not a block device and has no supported sysfs dev file")
+    raise FileNotFoundError(f"block device {identifier!r} not found in /dev or supported sysfs block paths")
 
 
 def log2_bucket_label(slot: int) -> str:
