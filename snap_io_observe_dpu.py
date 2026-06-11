@@ -187,17 +187,21 @@ def resolve_dpu_bdev_name(pid: int, ctrl: int, chains, maps) -> Optional[str]:
     return None
 
 
-def device_label(device_key: int, device_map: Dict[int, str], pid: int, chains, maps, unresolved: set, auto_names: bool) -> str:
+def device_label(device_key: int, device_map: Dict[int, str], pid: int, chains, maps, failed_log: set, auto_names: bool) -> str:
     if device_key in device_map:
         return device_map[device_key]
-    if auto_names and device_key and device_key not in unresolved:
+    if auto_names and device_key:
         name = resolve_dpu_bdev_name(pid, device_key, chains, maps)
         if name:
             device_map[device_key] = name
+            failed_log.discard(device_key)
             print(f"resolved_device device_key=0x{device_key:x} name={name}", file=sys.stderr)
             return name
-        unresolved.add(device_key)
-        print(f"warning: failed to resolve dpu device_key=0x{device_key:x} through configured name chains", file=sys.stderr)
+        # A controller can appear before every backend pointer is populated.
+        # Do not permanently suppress retries; only suppress repeated warnings.
+        if device_key not in failed_log:
+            failed_log.add(device_key)
+            print(f"warning: failed to resolve dpu device_key=0x{device_key:x} through configured name chains; will retry", file=sys.stderr)
     return f"0x{device_key:x}"
 
 
@@ -313,7 +317,7 @@ def main() -> int:
     size_counts_enabled = not args.no_size_counts
     auto_names = not args.no_auto_device_names
     proc_maps = parse_proc_maps(pid) if auto_names else []
-    device_map = dict(args.device_map); unresolved = set()
+    device_map = dict(args.device_map); failed_log = set()
     selected = {"mode": "dpu-snap-rdma-zc-done", "pid": pid, "binary": binary, "size_counts_enabled": size_counts_enabled, "auto_device_names": auto_names, "name_chains": [tuple(hex(x) for x in c) for c in args.name_chains]}
     if args.dry_run: print(json_dumps(selected)); return 0
     try:
@@ -335,7 +339,7 @@ def main() -> int:
     prev_stats, prev_hist, prev_size_counts = {}, {}, {}
     summary_stats = {}; summary_size_counts = {}
     def label(dev):
-        return device_label(dev, device_map, pid, args.name_chains, proc_maps, unresolved, auto_names)
+        return device_label(dev, device_map, pid, args.name_chains, proc_maps, failed_log, auto_names)
     while not stop:
         time.sleep(args.interval)
         names = thread_names(b["thread_names"]); now_stats = snapshot_stats(b["stats"]); now_hist = snapshot_hist(b["size_hist"]); now_size_counts = snapshot_size_counts(b["size_counts"])
