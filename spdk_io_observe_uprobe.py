@@ -28,9 +28,11 @@ from common import (
 #   static void bdev_nvme_submit_request(struct spdk_io_channel *ch,
 #                                        struct spdk_bdev_io *bdev_io)
 # The user's debug/bpftrace validation confirmed:
+#   bdev_io->bdev offset                 = 0x0
 #   bdev_io->type offset                 = 0x8
 #   bdev_io->u.bdev.num_blocks offset    = 0x250
-# This captures read/write through the same physical backend submit path.
+# This captures read/write through the same physical backend submit path and
+# groups rows by the stable backend bdev pointer device_key.
 BDEV_NVME_STRUCT_SIZE_CANDIDATES = [
     "bdev_nvme_submit_request",
 ]
@@ -89,6 +91,25 @@ def parse_int_auto(value: str) -> int:
     return int(value, 0)
 
 
+def parse_device_map(value: str) -> Dict[int, str]:
+    out: Dict[int, str] = {}
+    if not value:
+        return out
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise argparse.ArgumentTypeError("device map entries must be key=name")
+        key_s, name = item.split("=", 1)
+        out[int(key_s, 0)] = name
+    return out
+
+
+def device_label(device_key: int, device_map: Dict[int, str]) -> str:
+    return device_map.get(device_key, f"0x{device_key:x}")
+
+
 def preg_arg(n: int) -> str:
     return {
         1: "PT_REGS_PARM1(ctx)",
@@ -105,6 +126,7 @@ def build_bpf_text(
     lba_size: int,
     req_submit_arg: int,
     req_complete_arg: int,
+    bdev_io_bdev_offset: int,
     bdev_io_type_offset: int,
     bdev_io_num_blocks_offset: int,
     bdev_io_read_type: int,
@@ -130,6 +152,7 @@ def build_bpf_text(
     if (sv) {
         u64 delta_us = (bpf_ktime_get_ns() - sv->ts) / 1000;
         struct hist_key hk = {};
+        hk.device_key = 0;
         hk.op = sv->op;
         hk.tid = (u32)bpf_get_current_pid_tgid();
         hk.slot = bpf_log2l(delta_us ? delta_us : 1);
@@ -145,6 +168,7 @@ def build_bpf_text(
 #include <uapi/linux/ptrace.h>
 
 struct stat_key {{
+    u64 device_key;
     u32 op;
     u32 tid;
 }};
@@ -155,12 +179,14 @@ struct stat_val {{
 }};
 
 struct hist_key {{
+    u64 device_key;
     u32 op;
     u32 tid;
     u64 slot;
 }};
 
 struct size_count_key {{
+    u64 device_key;
     u32 op;
     u32 tid;
     u32 bytes;
@@ -243,24 +269,27 @@ static __always_inline void increment_stats(struct stat_key *key, u64 bytes)
     }}
 }}
 
-static __always_inline int submit_common(struct pt_regs *ctx, u32 op, u64 bytes, u64 req)
+static __always_inline int submit_common(struct pt_regs *ctx, u64 device_key, u32 op, u64 bytes, u64 req)
 {{
     u32 tid = (u32)bpf_get_current_pid_tgid();
     save_comm(tid);
 
     struct stat_key key = {{}};
+    key.device_key = device_key;
     key.op = op;
     key.tid = tid;
     increment_stats(&key, bytes);
 
     if (bytes > 0) {{
         struct hist_key hk = {{}};
+        hk.device_key = device_key;
         hk.op = op;
         hk.tid = tid;
         hk.slot = bpf_log2l(bytes);
         increment_size_hist(&hk);
 
         struct size_count_key sk = {{}};
+        sk.device_key = device_key;
         sk.op = op;
         sk.tid = tid;
         sk.bytes = (u32)bytes;
@@ -273,8 +302,10 @@ static __always_inline int submit_common(struct pt_regs *ctx, u32 op, u64 bytes,
 int trace_bdev_nvme_submit_request(struct pt_regs *ctx)
 {{
     u64 bdev_io = PT_REGS_PARM2(ctx);
+    u64 device_key = 0;
     u8 io_type = 0;
     u64 num_blocks = 0;
+    bpf_probe_read_user(&device_key, sizeof(device_key), (void *)(bdev_io + {bdev_io_bdev_offset}ULL));
     bpf_probe_read_user(&io_type, sizeof(io_type), (void *)(bdev_io + {bdev_io_type_offset}ULL));
     bpf_probe_read_user(&num_blocks, sizeof(num_blocks), (void *)(bdev_io + {bdev_io_num_blocks_offset}ULL));
 
@@ -284,41 +315,41 @@ int trace_bdev_nvme_submit_request(struct pt_regs *ctx)
     }} else if (io_type == {bdev_io_write_type}) {{
         op = 1;
     }}
-    return submit_common(ctx, op, num_blocks * {lba_size}ULL, 0);
+    return submit_common(ctx, device_key, op, num_blocks * {lba_size}ULL, 0);
 }}
 
 int trace_bdev_nvme_readv(struct pt_regs *ctx)
 {{
     u64 lba_count = PT_REGS_PARM5(ctx);
-    return submit_common(ctx, 0, lba_count * {lba_size}ULL, 0);
+    return submit_common(ctx, 0, 0, lba_count * {lba_size}ULL, 0);
 }}
 
 int trace_bdev_nvme_writev(struct pt_regs *ctx)
 {{
     u64 lba_count = PT_REGS_PARM5(ctx);
-    return submit_common(ctx, 1, lba_count * {lba_size}ULL, 0);
+    return submit_common(ctx, 0, 1, lba_count * {lba_size}ULL, 0);
 }}
 
 int trace_nvme_read(struct pt_regs *ctx)
 {{
     u64 lba_count = PT_REGS_PARM5(ctx);
-    return submit_common(ctx, 0, lba_count * {lba_size}ULL, 0);
+    return submit_common(ctx, 0, 0, lba_count * {lba_size}ULL, 0);
 }}
 
 int trace_nvme_write(struct pt_regs *ctx)
 {{
     u64 lba_count = PT_REGS_PARM5(ctx);
-    return submit_common(ctx, 1, lba_count * {lba_size}ULL, 0);
+    return submit_common(ctx, 0, 1, lba_count * {lba_size}ULL, 0);
 }}
 
 int trace_bdev_submit(struct pt_regs *ctx)
 {{
-    return submit_common(ctx, 4, 0, PT_REGS_PARM1(ctx));
+    return submit_common(ctx, 0, 4, 0, PT_REGS_PARM1(ctx));
 }}
 
 int trace_req_submit(struct pt_regs *ctx)
 {{
-    return submit_common(ctx, 4, 0, {submit_req});
+    return submit_common(ctx, 0, 4, 0, {submit_req});
 }}
 
 int trace_complete(struct pt_regs *ctx)
@@ -330,7 +361,7 @@ int trace_complete(struct pt_regs *ctx)
 
 
 class StatKey(ct.Structure):
-    _fields_ = [("op", ct.c_uint32), ("tid", ct.c_uint32)]
+    _fields_ = [("device_key", ct.c_uint64), ("op", ct.c_uint32), ("tid", ct.c_uint32)]
 
 
 class StatVal(ct.Structure):
@@ -338,11 +369,11 @@ class StatVal(ct.Structure):
 
 
 class HistKey(ct.Structure):
-    _fields_ = [("op", ct.c_uint32), ("tid", ct.c_uint32), ("slot", ct.c_uint64)]
+    _fields_ = [("device_key", ct.c_uint64), ("op", ct.c_uint32), ("tid", ct.c_uint32), ("slot", ct.c_uint64)]
 
 
 class SizeCountKey(ct.Structure):
-    _fields_ = [("op", ct.c_uint32), ("tid", ct.c_uint32), ("bytes", ct.c_uint32)]
+    _fields_ = [("device_key", ct.c_uint64), ("op", ct.c_uint32), ("tid", ct.c_uint32), ("bytes", ct.c_uint32)]
 
 
 def attach_uprobe_compat(b, obj: str, sym: str, fn: str, pid: int) -> None:
@@ -361,20 +392,20 @@ def describe_hits(title: str, hits):
         print(f"  {h.symbol} in {h.obj} via {h.source}", file=sys.stderr)
 
 
-def snapshot_hash(table) -> Dict[Tuple[int, int], Tuple[int, int]]:
-    return {(k.op, k.tid): (v.ios, v.bytes) for k, v in table.items()}
+def snapshot_hash(table) -> Dict[Tuple[int, int, int], Tuple[int, int]]:
+    return {(int(k.device_key), int(k.op), int(k.tid)): (int(v.ios), int(v.bytes)) for k, v in table.items()}
 
 
 def delta_stats(now, prev):
     return {k: (max(0, v[0] - prev.get(k, (0, 0))[0]), max(0, v[1] - prev.get(k, (0, 0))[1])) for k, v in now.items()}
 
 
-def snapshot_hist(table) -> Dict[Tuple[int, int, int], int]:
-    return {(k.op, k.tid, int(k.slot)): int(v.value) for k, v in table.items()}
+def snapshot_hist(table) -> Dict[Tuple[int, int, int, int], int]:
+    return {(int(k.device_key), int(k.op), int(k.tid), int(k.slot)): int(v.value) for k, v in table.items()}
 
 
-def snapshot_size_counts(table) -> Dict[Tuple[int, int, int], int]:
-    return {(k.op, k.tid, int(k.bytes)): int(v.value) for k, v in table.items()}
+def snapshot_size_counts(table) -> Dict[Tuple[int, int, int, int], int]:
+    return {(int(k.device_key), int(k.op), int(k.tid), int(k.bytes)): int(v.value) for k, v in table.items()}
 
 
 def delta_counts(now, prev):
@@ -416,15 +447,12 @@ def select_submit_hits(args, objects, submit_hits):
     selected = []
     seen = set()
 
-    # Prefer common bdev NVMe submit_request when present: it captures both
-    # read and write, including builds where bdev_nvme_writev was inlined away.
     bdev_struct_hits = [h for h in submit_hits if h.symbol in BDEV_NVME_STRUCT_SIZE_CANDIDATES]
     if bdev_struct_hits:
         first = choose_first(bdev_struct_hits, BDEV_NVME_STRUCT_SIZE_CANDIDATES)
         if first:
             return [first]
 
-    # Fall back to confirmed NVMf -> NVMe bdev readv/writev backend symbols.
     bdev_nvme_hits = [h for h in submit_hits if h.symbol in BDEV_NVME_SIZE_CANDIDATES]
     if bdev_nvme_hits:
         for sym in BDEV_NVME_SIZE_CANDIDATES:
@@ -436,7 +464,6 @@ def select_submit_hits(args, objects, submit_hits):
                     break
         return selected
 
-    # Fall back to public fixed-buffer NVMe read/write APIs.
     nvme_hits = [h for h in submit_hits if h.symbol in NVME_RW_SUBMIT_CANDIDATES]
     if nvme_hits:
         for sym in NVME_RW_SUBMIT_CANDIDATES:
@@ -477,6 +504,7 @@ def main() -> int:
     parser.add_argument("--pid", type=int, help="SPDK process pid; limits uprobes when supported by BCC")
     parser.add_argument("--binary", required=True, help="path to nvmf_tgt, spdk_tgt, or target process executable")
     parser.add_argument("--spdk-build-dir", help="SPDK build directory to scan for libspdk_*.so")
+    parser.add_argument("--device-map", type=parse_device_map, default={}, help="optional comma-separated key=name map, e.g. 0xb3c...=nvme0")
     parser.add_argument("--interval", type=float, default=1.0, help="print interval in seconds")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON lines")
     parser.add_argument("--hist", action="store_true", help="print log2 size histogram")
@@ -490,6 +518,7 @@ def main() -> int:
     parser.add_argument("--req-submit-arg", type=int, default=1, choices=[1, 2, 3, 4, 5, 6], help="argument index containing request pointer for generic request-level submit symbols")
     parser.add_argument("--req-complete-arg", type=int, default=1, choices=[1, 2, 3, 4, 5, 6], help="argument index containing request pointer for completion symbols")
     parser.add_argument("--lba-size", type=int, default=512, help="logical block size used for lba_count-to-byte conversion")
+    parser.add_argument("--bdev-io-bdev-offset", type=parse_int_auto, default=0x0, help="offset of struct spdk_bdev_io.bdev/device pointer; accepts hex, default 0x0")
     parser.add_argument("--bdev-io-type-offset", type=parse_int_auto, default=0x8, help="offset of struct spdk_bdev_io.type; accepts hex, default 0x8")
     parser.add_argument("--bdev-io-num-blocks-offset", type=parse_int_auto, default=0x250, help="offset of struct spdk_bdev_io.u.bdev.num_blocks; accepts hex, default 0x250")
     parser.add_argument("--bdev-io-read-type", type=parse_int_auto, default=1, help="SPDK_BDEV_IO_TYPE_READ numeric value, default 1")
@@ -513,7 +542,7 @@ def main() -> int:
     if args.list_symbols:
         describe_hits("submit candidates:", submit_hits)
         describe_hits("completion candidates:", complete_hits)
-        print("note: bdev_nvme_submit_request is preferred when present because it exposes struct spdk_bdev_io for read/write size accounting via offsets.", file=sys.stderr)
+        print("note: bdev_nvme_submit_request is preferred when present because it exposes struct spdk_bdev_io for read/write size/device accounting via offsets.", file=sys.stderr)
         return 0
 
     selected_submit_hits = select_submit_hits(args, objects, submit_hits)
@@ -551,8 +580,11 @@ def main() -> int:
         "bytes_supported": not zero_byte_fallback,
         "size_hist_supported": not zero_byte_fallback,
         "size_counts_supported": not zero_byte_fallback,
+        "device_key": "bdev_io + bdev_io_bdev_offset for bdev_nvme_submit_request; 0 for fallback symbols",
+        "device_map": args.device_map,
         "req_submit_arg": args.req_submit_arg,
         "req_complete_arg": args.req_complete_arg,
+        "bdev_io_bdev_offset": args.bdev_io_bdev_offset,
         "bdev_io_type_offset": args.bdev_io_type_offset,
         "bdev_io_num_blocks_offset": args.bdev_io_num_blocks_offset,
         "bdev_io_read_type": args.bdev_io_read_type,
@@ -573,6 +605,7 @@ def main() -> int:
         args.lba_size,
         args.req_submit_arg,
         args.req_complete_arg,
+        args.bdev_io_bdev_offset,
         args.bdev_io_type_offset,
         args.bdev_io_num_blocks_offset,
         args.bdev_io_read_type,
@@ -586,7 +619,6 @@ def main() -> int:
         "bdev_nvme_writev": "trace_bdev_nvme_writev",
         "spdk_nvme_ns_cmd_read": "trace_nvme_read",
         "spdk_nvme_ns_cmd_write": "trace_nvme_write",
-        # Manual only. Kept for deliberate experiments after prototype verification.
         "spdk_nvme_ns_cmd_readv": "trace_nvme_read",
         "spdk_nvme_ns_cmd_writev": "trace_nvme_write",
     }
@@ -606,7 +638,7 @@ def main() -> int:
         return 2
 
     print("attached: " + ", ".join(attached), file=sys.stderr)
-    print(f"mode={mode} bytes_supported={not zero_byte_fallback} latency_supported={latency_supported}", file=sys.stderr)
+    print(f"mode={mode} bytes_supported={not zero_byte_fallback} latency_supported={latency_supported} device_key=bdev", file=sys.stderr)
 
     stop = False
 
@@ -617,8 +649,8 @@ def main() -> int:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
     prev_stats, prev_size_hist, prev_size_counts, prev_lat = {}, {}, {}, {}
-    summary: Dict[Tuple[int, int], Tuple[int, int]] = {}
-    summary_size_counts: Dict[Tuple[int, int, int], int] = {}
+    summary: Dict[Tuple[int, int, int], Tuple[int, int]] = {}
+    summary_size_counts: Dict[Tuple[int, int, int, int], int] = {}
 
     while not stop:
         time.sleep(args.interval)
@@ -641,8 +673,8 @@ def main() -> int:
 
         if args.json:
             rows = []
-            for (op, tid), (ios, bytes_) in sorted(d_stats.items()):
-                row = {"op": OP_NAMES.get(op, "other"), "tid": tid, "thread": names.get(tid, ""), "ios": ios}
+            for (device_key, op, tid), (ios, bytes_) in sorted(d_stats.items()):
+                row = {"device_key": f"0x{device_key:x}", "device": device_label(device_key, args.device_map), "op": OP_NAMES.get(op, "other"), "tid": tid, "thread": names.get(tid, ""), "ios": ios}
                 if not zero_byte_fallback:
                     row.update({"bytes": bytes_, "avg_size": (bytes_ / ios if ios else 0)})
                 else:
@@ -650,48 +682,48 @@ def main() -> int:
                 rows.append(row)
             size_rows = []
             if not zero_byte_fallback:
-                for (op, tid, size), count in sorted(d_size_counts.items()):
-                    size_rows.append({"op": OP_NAMES.get(op, "other"), "tid": tid, "thread": names.get(tid, ""), "size_bytes": size, "count": count})
+                for (device_key, op, tid, size), count in sorted(d_size_counts.items()):
+                    size_rows.append({"device_key": f"0x{device_key:x}", "device": device_label(device_key, args.device_map), "op": OP_NAMES.get(op, "other"), "tid": tid, "thread": names.get(tid, ""), "size_bytes": size, "count": count})
             print(json_dumps({"ts": time.time(), "interval": args.interval, "stats": rows, "size_counts": size_rows, "mode": mode, "latency_supported": latency_supported}))
             continue
 
         print(time.strftime("%H:%M:%S"))
-        for (op, tid), (ios, bytes_) in sorted(d_stats.items()):
+        for (device_key, op, tid), (ios, bytes_) in sorted(d_stats.items()):
             if zero_byte_fallback:
-                print(f"tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes=unsupported avg_size=unsupported")
+                print(f"device={device_label(device_key, args.device_map):<18} device_key=0x{device_key:x} tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes=unsupported avg_size=unsupported")
             else:
                 avg = bytes_ / ios if ios else 0
-                print(f"tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes={bytes_:<12} avg_size={avg:.1f}")
+                print(f"device={device_label(device_key, args.device_map):<18} device_key=0x{device_key:x} tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes={bytes_:<12} avg_size={avg:.1f}")
 
         if args.hist and not zero_byte_fallback:
-            for (op, tid) in sorted({(op, tid) for op, tid, _ in d_size_hist}):
-                rows = {slot: cnt for (o, t, slot), cnt in d_size_hist.items() if o == op and t == tid}
-                print_log2_hist(f"size_hist tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows, "bytes")
+            for device_key, op, tid in sorted({(dev, op, tid) for dev, op, tid, _ in d_size_hist}):
+                rows = {slot: cnt for (dev, o, t, slot), cnt in d_size_hist.items() if dev == device_key and o == op and t == tid}
+                print_log2_hist(f"size_hist device={device_label(device_key, args.device_map)} device_key=0x{device_key:x} tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows, "bytes")
         elif args.hist and zero_byte_fallback:
             print("size histogram unsupported for pointer-only attach mode")
 
         if args.size_counts and not zero_byte_fallback:
-            for (op, tid) in sorted({(op, tid) for op, tid, _ in d_size_counts}):
-                rows = {size: cnt for (o, t, size), cnt in d_size_counts.items() if o == op and t == tid}
-                print_size_counts(f"size_counts tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows)
+            for device_key, op, tid in sorted({(dev, op, tid) for dev, op, tid, _ in d_size_counts}):
+                rows = {size: cnt for (dev, o, t, size), cnt in d_size_counts.items() if dev == device_key and o == op and t == tid}
+                print_size_counts(f"size_counts device={device_label(device_key, args.device_map)} device_key=0x{device_key:x} tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows)
         elif args.size_counts and zero_byte_fallback:
             print("size counts unsupported for pointer-only attach mode")
 
         if latency_supported:
-            for (op, tid) in sorted({(op, tid) for op, tid, _ in d_lat}):
-                rows = {slot: cnt for (o, t, slot), cnt in d_lat.items() if o == op and t == tid}
-                print_log2_hist(f"latency tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows, "usec")
+            for device_key, op, tid in sorted({(dev, op, tid) for dev, op, tid, _ in d_lat}):
+                rows = {slot: cnt for (dev, o, t, slot), cnt in d_lat.items() if dev == device_key and o == op and t == tid}
+                print_log2_hist(f"latency device={device_label(device_key, args.device_map)} device_key=0x{device_key:x} tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows, "usec")
 
     print("summary", file=sys.stderr)
-    for (op, tid), (ios, bytes_) in sorted(summary.items()):
+    for (device_key, op, tid), (ios, bytes_) in sorted(summary.items()):
         if zero_byte_fallback:
-            print(f"tid={tid} {OP_NAMES.get(op, 'other')} ios={ios} bytes=unsupported", file=sys.stderr)
+            print(f"device={device_label(device_key, args.device_map)} device_key=0x{device_key:x} tid={tid} {OP_NAMES.get(op, 'other')} ios={ios} bytes=unsupported", file=sys.stderr)
         else:
-            print(f"tid={tid} {OP_NAMES.get(op, 'other')} ios={ios} bytes={bytes_}", file=sys.stderr)
+            print(f"device={device_label(device_key, args.device_map)} device_key=0x{device_key:x} tid={tid} {OP_NAMES.get(op, 'other')} ios={ios} bytes={bytes_}", file=sys.stderr)
     if args.size_counts and not zero_byte_fallback:
         print("summary_size_counts", file=sys.stderr)
-        for (op, tid, size), count in sorted(summary_size_counts.items()):
-            print(f"tid={tid} {OP_NAMES.get(op, 'other')} size_bytes={size} count={count}", file=sys.stderr)
+        for (device_key, op, tid, size), count in sorted(summary_size_counts.items()):
+            print(f"device={device_label(device_key, args.device_map)} device_key=0x{device_key:x} tid={tid} {OP_NAMES.get(op, 'other')} size_bytes={size} count={count}", file=sys.stderr)
     return 0
 
 
