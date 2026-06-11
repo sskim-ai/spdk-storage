@@ -88,7 +88,7 @@ def _major_minor_from_uevent(name: str) -> Optional[Tuple[int, int]]:
 def _major_minor_from_sysfs_dev(name: str) -> Optional[Tuple[int, int]]:
     """Last-resort sysfs fallback.
 
-    Prefer /proc/diskstats and uevent.  Avoid /device/dev for filtering because
+    Prefer /proc/diskstats and uevent. Avoid /device/dev for filtering because
     NVMe path devices may expose the parent controller/device dev there rather
     than the block layer major:minor used by block tracepoints.
     """
@@ -241,41 +241,6 @@ def symbols_from_object(path: str) -> Dict[str, str]:
     return symbols
 
 
-def broad_symbols_from_object(path: str, keywords: Sequence[str]) -> Dict[str, str]:
-    """Return symbols containing any keyword.
-
-    This is intentionally broader than symbols_from_object() for SNAP/DPU
-    environments where proprietary symbols may not use SPDK-style prefixes.
-    """
-    lowered = [k.lower() for k in keywords]
-    symbols: Dict[str, str] = {}
-    commands = [
-        ("nm-D", ["nm", "-D", path]),
-        ("nm", ["nm", "-an", path]),
-        ("readelf", ["readelf", "-Ws", path]),
-        ("objdump", ["objdump", "-t", path]),
-    ]
-    for source, cmd in commands:
-        if shutil.which(cmd[0]) is None:
-            continue
-        text = run_tool(cmd)
-        for line in text.splitlines():
-            for token in line.replace("\t", " ").split():
-                sym = token.split("@@")[0].split("@")[0]
-                low = sym.lower()
-                if any(k in low for k in lowered):
-                    symbols.setdefault(sym, source)
-    return symbols
-
-
-def discover_symbols_fuzzy(objects: Iterable[str], keywords: Sequence[str]) -> List[SymbolHit]:
-    hits: List[SymbolHit] = []
-    for obj in objects:
-        for sym, source in broad_symbols_from_object(obj, keywords).items():
-            hits.append(SymbolHit(obj=obj, symbol=sym, source=source))
-    return hits
-
-
 def discover_symbols(objects: Iterable[str], candidates: Sequence[str]) -> List[SymbolHit]:
     hits: List[SymbolHit] = []
     for obj in objects:
@@ -291,10 +256,3 @@ def choose_first(hits: Sequence[SymbolHit], candidates: Sequence[str]) -> Option
     if not hits:
         return None
     return sorted(hits, key=lambda h: (rank.get(h.symbol, 10_000), h.obj))[0]
-
-
-def bcc_import_error(exc: Exception) -> str:
-    return (
-        f"failed to import/load BCC: {exc}. Install python3-bcc/bpfcc-tools and matching kernel headers; "
-        "Ubuntu 24.04 often needs linux-headers-$(uname -r)."
-    )
