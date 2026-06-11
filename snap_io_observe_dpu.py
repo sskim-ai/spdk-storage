@@ -317,7 +317,7 @@ def main() -> int:
     size_counts_enabled = not args.no_size_counts
     auto_names = not args.no_auto_device_names
     proc_maps = parse_proc_maps(pid) if auto_names else []
-    device_map = dict(args.device_map); failed_log = set()
+    device_map = dict(args.device_map); failed_log = set(); seen_device_keys = set()
     selected = {"mode": "dpu-snap-rdma-zc-done", "pid": pid, "binary": binary, "size_counts_enabled": size_counts_enabled, "auto_device_names": auto_names, "name_chains": [tuple(hex(x) for x in c) for c in args.name_chains]}
     if args.dry_run: print(json_dumps(selected)); return 0
     try:
@@ -340,11 +340,20 @@ def main() -> int:
     summary_stats = {}; summary_size_counts = {}
     def label(dev):
         return device_label(dev, device_map, pid, args.name_chains, proc_maps, failed_log, auto_names)
+    def retry_seen_device_names():
+        if not auto_names:
+            return
+        for dev in sorted(seen_device_keys):
+            if dev and dev not in device_map:
+                label(dev)
     while not stop:
         time.sleep(args.interval)
         names = thread_names(b["thread_names"]); now_stats = snapshot_stats(b["stats"]); now_hist = snapshot_hist(b["size_hist"]); now_size_counts = snapshot_size_counts(b["size_counts"])
         d_stats = delta_stats(now_stats, prev_stats); d_hist = delta_counts(now_hist, prev_hist); d_size_counts = delta_counts(now_size_counts, prev_size_counts)
         prev_stats, prev_hist, prev_size_counts = now_stats, now_hist, now_size_counts
+        seen_device_keys.update(k[0] for k in now_stats.keys())
+        seen_device_keys.update(k[0] for k in now_size_counts.keys())
+        retry_seen_device_names()
         for key, val in d_stats.items():
             old = summary_stats.get(key, (0, 0, 0)); summary_stats[key] = tuple(old[i] + val[i] for i in range(3))
         for key, val in d_size_counts.items(): summary_size_counts[key] = summary_size_counts.get(key, 0) + val
@@ -370,6 +379,7 @@ def main() -> int:
                 rows = {size: cnt for (dev, d, o, t, size), cnt in d_size_counts.items() if dev == device_key and d == direction and o == op and t == tid}
                 print_size_counts(f"size_counts device={label(device_key)} device_key=0x{device_key:x} {DIR_NAMES.get(direction, direction)} tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, f'op{op}')}", rows)
     print("summary", file=sys.stderr)
+    retry_seen_device_names()
     for (device_key, direction, op, tid, mode), (ios, bytes_, sized_ios) in sorted(summary_stats.items()):
         avg = bytes_ / sized_ios if sized_ios else 0
         print(f"device={label(device_key)} device_key=0x{device_key:x} {DIR_NAMES.get(direction, direction)} {MODE_NAMES.get(mode, mode)} tid={tid} {OP_NAMES.get(op, f'op{op}')} ios={ios} bytes={bytes_} avg_size={avg:.1f}", file=sys.stderr)
