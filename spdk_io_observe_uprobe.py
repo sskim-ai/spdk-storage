@@ -1,92 +1,43 @@
 #!/usr/bin/env python3
-"""Observe SPDK/vfio userspace IO with BCC uprobes."""
+"""Observe the validated SPDK backend NVMe bdev submit path with BCC uprobes.
+
+Default behavior is intentionally optimized for the user's verified Storage path:
+
+  symbol      = bdev_nvme_submit_request
+  arg2        = struct spdk_bdev_io *bdev_io
+  device_key  = *(uint64_t *)(bdev_io + 0x0)      # struct spdk_bdev *
+  io_type     = *(uint8_t  *)(bdev_io + 0x8)
+  num_blocks  = *(uint64_t *)(bdev_io + 0x250)
+
+The observer groups IO by device_key and resolves device_key -> SPDK bdev name
+through gdb by default. Use --no-auto-device-names to disable this.
+"""
 
 from __future__ import annotations
 
 import argparse
 import ctypes as ct
+import os
 import re
 import signal
 import subprocess
 import sys
 import time
-from typing import Dict, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
-from common import (
-    OP_NAMES,
-    SymbolHit,
-    choose_first,
-    diagnostics,
-    discover_symbols,
-    iter_elf_objects,
-    json_dumps,
-    print_log2_hist,
-    require_root,
-)
+from common import diagnostics, json_dumps, print_log2_hist, require_root
 
 
-# Size-capable common backend submit symbol for the user's NVMf -> NVMe bdev path.
-# Prototype confirmed from the user's SPDK build:
-#   static void bdev_nvme_submit_request(struct spdk_io_channel *ch,
-#                                        struct spdk_bdev_io *bdev_io)
-# The user's debug/bpftrace validation confirmed:
-#   bdev_io->bdev offset                 = 0x0
-#   bdev_io->type offset                 = 0x8
-#   bdev_io->u.bdev.num_blocks offset    = 0x250
-# This captures read/write through the same physical backend submit path and
-# groups rows by the stable backend bdev pointer device_key.
-BDEV_NVME_STRUCT_SIZE_CANDIDATES = [
-    "bdev_nvme_submit_request",
-]
+SUBMIT_SYMBOL = "bdev_nvme_submit_request"
 
-# Size-capable backend symbols for builds where readv/writev survive as symbols.
-# Confirmed read prototype from the user's SPDK build:
-#   static int bdev_nvme_readv(struct nvme_bdev_io *bio,
-#       struct iovec *iov, int iovcnt, void *md,
-#       uint64_t lba_count, uint64_t lba, uint64_t flag,
-#       struct spdk_memory_domain *domain, void *domain_ctx,
-#       struct spdk_accel_sequence *seq)
-# Therefore lba_count is C arg5 == PT_REGS_PARM5(ctx) == bpftrace arg4.
-BDEV_NVME_SIZE_CANDIDATES = [
-    "bdev_nvme_readv",
-    "bdev_nvme_writev",
-]
-
-# Safe fixed-buffer NVMe public APIs. These symbols may exist but are not
-# necessarily on the NVMf target runtime path.
-NVME_RW_SUBMIT_CANDIDATES = [
-    "spdk_nvme_ns_cmd_read",
-    "spdk_nvme_ns_cmd_write",
-]
-
-NVME_VECTOR_SUBMIT_CANDIDATES = [
-    "spdk_nvme_ns_cmd_readv",
-    "spdk_nvme_ns_cmd_writev",
-]
-
-NVME_SUBMIT_CANDIDATES = NVME_RW_SUBMIT_CANDIDATES + NVME_VECTOR_SUBMIT_CANDIDATES
-
-BDEV_SUBMIT_CANDIDATES = [
-    "spdk_bdev_io_submit",
-    "bdev_io_submit",
-    "spdk_bdev_read",
-    "spdk_bdev_write",
-    "spdk_bdev_read_blocks",
-    "spdk_bdev_write_blocks",
-    "spdk_bdev_readv",
-    "spdk_bdev_writev",
-]
-
-REQUEST_SUBMIT_CANDIDATES = [
-    "nvme_qpair_submit_request",
-    "nvme_transport_qpair_submit_request",
-]
-
-COMPLETE_CANDIDATES = [
-    "spdk_bdev_io_complete",
-    "bdev_io_complete",
-    "nvme_complete_request",
-]
+OP_READ = 0
+OP_WRITE = 1
+OP_OTHER = 4
+OP_NAMES = {
+    OP_READ: "read",
+    OP_WRITE: "write",
+    OP_OTHER: "other",
+}
 
 
 def parse_int_auto(value: str) -> int:
@@ -108,7 +59,54 @@ def parse_device_map(value: str) -> Dict[int, str]:
     return out
 
 
-def resolve_bdev_name_with_gdb(pid: int, device_key: int, gdb_path: str, timeout: float) -> str | None:
+def run_text(cmd: Iterable[str], timeout: float = 2.0) -> str:
+    try:
+        result = subprocess.run(list(cmd), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout.strip()
+
+
+def auto_pid() -> Optional[int]:
+    for cmd in (["pidof", "nvmf_tgt"], ["pidof", "spdk_tgt"]):
+        out = run_text(cmd)
+        if out:
+            try:
+                return int(out.split()[0])
+            except ValueError:
+                pass
+    out = run_text(["pgrep", "-n", "-f", "nvmf_tgt|spdk_tgt"])
+    if out:
+        try:
+            return int(out.splitlines()[-1].strip())
+        except ValueError:
+            return None
+    return None
+
+
+def auto_binary(pid: int) -> Optional[str]:
+    if pid > 0:
+        exe = f"/proc/{pid}/exe"
+        try:
+            path = os.readlink(exe)
+            if path:
+                return path
+        except OSError:
+            pass
+    for path in (
+        "/root/bin/nvmf_tgt",
+        "/root/spdk/build/bin/nvmf_tgt",
+        "/usr/local/bin/nvmf_tgt",
+        "/root/bin/spdk_tgt",
+        "/root/spdk/build/bin/spdk_tgt",
+        "/usr/local/bin/spdk_tgt",
+    ):
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def resolve_bdev_name_with_gdb(pid: int, device_key: int, gdb_path: str, timeout: float) -> Optional[str]:
     if pid <= 0 or device_key == 0:
         return None
     expr = f"((struct spdk_bdev *)0x{device_key:x})->name"
@@ -129,72 +127,14 @@ def resolve_bdev_name_with_gdb(pid: int, device_key: int, gdb_path: str, timeout
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    text = result.stdout or ""
-    matches = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', text)
+    matches = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', result.stdout or "")
     if not matches:
         return None
     name = bytes(matches[-1], "utf-8").decode("unicode_escape", "replace")
     return name or None
 
 
-def device_label(device_key: int, device_map: Dict[int, str]) -> str:
-    return device_map.get(device_key, f"0x{device_key:x}")
-
-
-def preg_arg(n: int) -> str:
-    return {
-        1: "PT_REGS_PARM1(ctx)",
-        2: "PT_REGS_PARM2(ctx)",
-        3: "PT_REGS_PARM3(ctx)",
-        4: "PT_REGS_PARM4(ctx)",
-        5: "PT_REGS_PARM5(ctx)",
-        6: "PT_REGS_PARM6(ctx)",
-    }.get(n, "PT_REGS_PARM1(ctx)")
-
-
-def build_bpf_text(
-    want_latency: bool,
-    lba_size: int,
-    req_submit_arg: int,
-    req_complete_arg: int,
-    bdev_io_bdev_offset: int,
-    bdev_io_type_offset: int,
-    bdev_io_num_blocks_offset: int,
-    bdev_io_read_type: int,
-    bdev_io_write_type: int,
-) -> str:
-    latency_submit = (
-        """
-    if (req != 0) {
-        struct start_val sv = {};
-        sv.ts = bpf_ktime_get_ns();
-        sv.op = op;
-        starts.update(&req, &sv);
-    }
-"""
-        if want_latency
-        else ""
-    )
-    complete_req = preg_arg(req_complete_arg)
-    latency_complete = (
-        """
-    u64 req = COMPLETE_REQ_EXPR;
-    struct start_val *sv = starts.lookup(&req);
-    if (sv) {
-        u64 delta_us = (bpf_ktime_get_ns() - sv->ts) / 1000;
-        struct hist_key hk = {};
-        hk.device_key = 0;
-        hk.op = sv->op;
-        hk.tid = (u32)bpf_get_current_pid_tgid();
-        hk.slot = bpf_log2l(delta_us ? delta_us : 1);
-        increment_lat_hist(&hk);
-        starts.delete(&req);
-    }
-""".replace("COMPLETE_REQ_EXPR", complete_req)
-        if want_latency
-        else ""
-    )
-    submit_req = preg_arg(req_submit_arg)
+def build_bpf_text(args) -> str:
     return f"""
 #include <uapi/linux/ptrace.h>
 
@@ -223,21 +163,13 @@ struct size_count_key {{
     u32 bytes;
 }};
 
-struct start_val {{
-    u64 ts;
-    u32 op;
+struct comm_val {{
+    char comm[16];
 }};
 
 BPF_HASH(stats, struct stat_key, struct stat_val);
 BPF_HASH(size_hist, struct hist_key, u64);
 BPF_HASH(size_counts, struct size_count_key, u64);
-BPF_HASH(lat_hist, struct hist_key, u64);
-BPF_HASH(starts, u64, struct start_val);
-
-struct comm_val {{
-    char comm[16];
-}};
-
 BPF_HASH(thread_names, u32, struct comm_val);
 
 static __always_inline void save_comm(u32 tid)
@@ -247,46 +179,7 @@ static __always_inline void save_comm(u32 tid)
     thread_names.update(&tid, &val);
 }}
 
-static __always_inline void increment_size_hist(struct hist_key *key)
-{{
-    u64 zero = 0, *val;
-    val = size_hist.lookup(key);
-    if (val) {{
-        __sync_fetch_and_add(val, 1);
-    }} else {{
-        size_hist.update(key, &zero);
-        val = size_hist.lookup(key);
-        if (val) __sync_fetch_and_add(val, 1);
-    }}
-}}
-
-static __always_inline void increment_size_count(struct size_count_key *key)
-{{
-    u64 zero = 0, *val;
-    val = size_counts.lookup(key);
-    if (val) {{
-        __sync_fetch_and_add(val, 1);
-    }} else {{
-        size_counts.update(key, &zero);
-        val = size_counts.lookup(key);
-        if (val) __sync_fetch_and_add(val, 1);
-    }}
-}}
-
-static __always_inline void increment_lat_hist(struct hist_key *key)
-{{
-    u64 zero = 0, *val;
-    val = lat_hist.lookup(key);
-    if (val) {{
-        __sync_fetch_and_add(val, 1);
-    }} else {{
-        lat_hist.update(key, &zero);
-        val = lat_hist.lookup(key);
-        if (val) __sync_fetch_and_add(val, 1);
-    }}
-}}
-
-static __always_inline void increment_stats(struct stat_key *key, u64 bytes)
+static __always_inline void inc_stat(struct stat_key *key, u64 bytes)
 {{
     struct stat_val zero = {{}}, *val;
     val = stats.lookup(key);
@@ -300,34 +193,26 @@ static __always_inline void increment_stats(struct stat_key *key, u64 bytes)
     }}
 }}
 
-static __always_inline int submit_common(struct pt_regs *ctx, u64 device_key, u32 op, u64 bytes, u64 req)
+static __always_inline void inc_hist(struct hist_key *key)
 {{
-    u32 tid = (u32)bpf_get_current_pid_tgid();
-    save_comm(tid);
-
-    struct stat_key key = {{}};
-    key.device_key = device_key;
-    key.op = op;
-    key.tid = tid;
-    increment_stats(&key, bytes);
-
-    if (bytes > 0) {{
-        struct hist_key hk = {{}};
-        hk.device_key = device_key;
-        hk.op = op;
-        hk.tid = tid;
-        hk.slot = bpf_log2l(bytes);
-        increment_size_hist(&hk);
-
-        struct size_count_key sk = {{}};
-        sk.device_key = device_key;
-        sk.op = op;
-        sk.tid = tid;
-        sk.bytes = (u32)bytes;
-        increment_size_count(&sk);
+    u64 zero = 0, *val;
+    val = size_hist.lookup(key);
+    if (!val) {{
+        size_hist.update(key, &zero);
+        val = size_hist.lookup(key);
     }}
-{latency_submit}
-    return 0;
+    if (val) __sync_fetch_and_add(val, 1);
+}}
+
+static __always_inline void inc_size_count(struct size_count_key *key)
+{{
+    u64 zero = 0, *val;
+    val = size_counts.lookup(key);
+    if (!val) {{
+        size_counts.update(key, &zero);
+        val = size_counts.lookup(key);
+    }}
+    if (val) __sync_fetch_and_add(val, 1);
 }}
 
 int trace_bdev_nvme_submit_request(struct pt_regs *ctx)
@@ -336,56 +221,43 @@ int trace_bdev_nvme_submit_request(struct pt_regs *ctx)
     u64 device_key = 0;
     u8 io_type = 0;
     u64 num_blocks = 0;
-    bpf_probe_read_user(&device_key, sizeof(device_key), (void *)(bdev_io + {bdev_io_bdev_offset}ULL));
-    bpf_probe_read_user(&io_type, sizeof(io_type), (void *)(bdev_io + {bdev_io_type_offset}ULL));
-    bpf_probe_read_user(&num_blocks, sizeof(num_blocks), (void *)(bdev_io + {bdev_io_num_blocks_offset}ULL));
 
-    u32 op = 4;
-    if (io_type == {bdev_io_read_type}) {{
-        op = 0;
-    }} else if (io_type == {bdev_io_write_type}) {{
-        op = 1;
+    bpf_probe_read_user(&device_key, sizeof(device_key), (void *)(bdev_io + {args.bdev_io_bdev_offset}ULL));
+    bpf_probe_read_user(&io_type, sizeof(io_type), (void *)(bdev_io + {args.bdev_io_type_offset}ULL));
+    bpf_probe_read_user(&num_blocks, sizeof(num_blocks), (void *)(bdev_io + {args.bdev_io_num_blocks_offset}ULL));
+
+    u32 op = {OP_OTHER};
+    if (io_type == {args.bdev_io_read_type}) {{
+        op = {OP_READ};
+    }} else if (io_type == {args.bdev_io_write_type}) {{
+        op = {OP_WRITE};
     }}
-    return submit_common(ctx, device_key, op, num_blocks * {lba_size}ULL, 0);
-}}
 
-int trace_bdev_nvme_readv(struct pt_regs *ctx)
-{{
-    u64 lba_count = PT_REGS_PARM5(ctx);
-    return submit_common(ctx, 0, 0, lba_count * {lba_size}ULL, 0);
-}}
+    u64 bytes = num_blocks * {args.lba_size}ULL;
+    u32 tid = (u32)bpf_get_current_pid_tgid();
+    save_comm(tid);
 
-int trace_bdev_nvme_writev(struct pt_regs *ctx)
-{{
-    u64 lba_count = PT_REGS_PARM5(ctx);
-    return submit_common(ctx, 0, 1, lba_count * {lba_size}ULL, 0);
-}}
+    struct stat_key sk = {{}};
+    sk.device_key = device_key;
+    sk.op = op;
+    sk.tid = tid;
+    inc_stat(&sk, bytes);
 
-int trace_nvme_read(struct pt_regs *ctx)
-{{
-    u64 lba_count = PT_REGS_PARM5(ctx);
-    return submit_common(ctx, 0, 0, lba_count * {lba_size}ULL, 0);
-}}
+    if (bytes > 0) {{
+        struct hist_key hk = {{}};
+        hk.device_key = device_key;
+        hk.op = op;
+        hk.tid = tid;
+        hk.slot = bpf_log2l(bytes);
+        inc_hist(&hk);
 
-int trace_nvme_write(struct pt_regs *ctx)
-{{
-    u64 lba_count = PT_REGS_PARM5(ctx);
-    return submit_common(ctx, 0, 1, lba_count * {lba_size}ULL, 0);
-}}
-
-int trace_bdev_submit(struct pt_regs *ctx)
-{{
-    return submit_common(ctx, 0, 4, 0, PT_REGS_PARM1(ctx));
-}}
-
-int trace_req_submit(struct pt_regs *ctx)
-{{
-    return submit_common(ctx, 0, 4, 0, {submit_req});
-}}
-
-int trace_complete(struct pt_regs *ctx)
-{{
-{latency_complete}
+        struct size_count_key ck = {{}};
+        ck.device_key = device_key;
+        ck.op = op;
+        ck.tid = tid;
+        ck.bytes = (u32)bytes;
+        inc_size_count(&ck);
+    }}
     return 0;
 }}
 """
@@ -407,28 +279,8 @@ class SizeCountKey(ct.Structure):
     _fields_ = [("device_key", ct.c_uint64), ("op", ct.c_uint32), ("tid", ct.c_uint32), ("bytes", ct.c_uint32)]
 
 
-def attach_uprobe_compat(b, obj: str, sym: str, fn: str, pid: int) -> None:
-    try:
-        b.attach_uprobe(name=obj, sym=sym, fn_name=fn, pid=pid)
-    except TypeError:
-        b.attach_uprobe(name=obj, sym=sym, fn_name=fn)
-
-
-def describe_hits(title: str, hits):
-    print(title, file=sys.stderr)
-    if not hits:
-        print("  none", file=sys.stderr)
-        return
-    for h in hits:
-        print(f"  {h.symbol} in {h.obj} via {h.source}", file=sys.stderr)
-
-
-def snapshot_hash(table) -> Dict[Tuple[int, int, int], Tuple[int, int]]:
+def snapshot_stats(table) -> Dict[Tuple[int, int, int], Tuple[int, int]]:
     return {(int(k.device_key), int(k.op), int(k.tid)): (int(v.ios), int(v.bytes)) for k, v in table.items()}
-
-
-def delta_stats(now, prev):
-    return {k: (max(0, v[0] - prev.get(k, (0, 0))[0]), max(0, v[1] - prev.get(k, (0, 0))[1])) for k, v in now.items()}
 
 
 def snapshot_hist(table) -> Dict[Tuple[int, int, int, int], int]:
@@ -439,86 +291,20 @@ def snapshot_size_counts(table) -> Dict[Tuple[int, int, int, int], int]:
     return {(int(k.device_key), int(k.op), int(k.tid), int(k.bytes)): int(v.value) for k, v in table.items()}
 
 
+def delta_stats(now, prev):
+    return {k: (max(0, v[0] - prev.get(k, (0, 0))[0]), max(0, v[1] - prev.get(k, (0, 0))[1])) for k, v in now.items() if v != prev.get(k, (0, 0))}
+
+
 def delta_counts(now, prev):
     return {k: v - prev.get(k, 0) for k, v in now.items() if v - prev.get(k, 0) > 0}
 
 
 def thread_names(table) -> Dict[int, str]:
-    out = {}
+    out: Dict[int, str] = {}
     for k, v in table.items():
         raw = bytes(v.comm).split(b"\0", 1)[0]
         out[int(k.value)] = raw.decode("utf-8", "replace")
     return out
-
-
-def manual_hit(symbol: str, objects, obj_override: str = None) -> SymbolHit:
-    obj = obj_override or objects[0]
-    return SymbolHit(obj=obj, symbol=symbol, source="manual")
-
-
-def selected_mode(selected_submit_hits, latency_supported: bool) -> str:
-    syms = [h.symbol for h in selected_submit_hits]
-    if any(sym in BDEV_NVME_STRUCT_SIZE_CANDIDATES for sym in syms):
-        return "bdev-nvme-submit-request-size"
-    if any(sym in BDEV_NVME_SIZE_CANDIDATES for sym in syms):
-        return "bdev-nvme-rw-size"
-    if all(sym in NVME_RW_SUBMIT_CANDIDATES for sym in syms):
-        return "nvme-rw-size"
-    if any(sym in NVME_VECTOR_SUBMIT_CANDIDATES for sym in syms):
-        return "manual-vector-experimental"
-    if latency_supported:
-        return "request-pointer-latency"
-    return "pointer-only-no-size"
-
-
-def select_submit_hits(args, objects, submit_hits):
-    if args.submit_symbol:
-        return [manual_hit(args.submit_symbol, objects, args.submit_object)]
-
-    selected = []
-    seen = set()
-
-    bdev_struct_hits = [h for h in submit_hits if h.symbol in BDEV_NVME_STRUCT_SIZE_CANDIDATES]
-    if bdev_struct_hits:
-        first = choose_first(bdev_struct_hits, BDEV_NVME_STRUCT_SIZE_CANDIDATES)
-        if first:
-            return [first]
-
-    bdev_nvme_hits = [h for h in submit_hits if h.symbol in BDEV_NVME_SIZE_CANDIDATES]
-    if bdev_nvme_hits:
-        for sym in BDEV_NVME_SIZE_CANDIDATES:
-            for hit in bdev_nvme_hits:
-                key = (hit.obj, hit.symbol)
-                if hit.symbol == sym and key not in seen:
-                    seen.add(key)
-                    selected.append(hit)
-                    break
-        return selected
-
-    nvme_hits = [h for h in submit_hits if h.symbol in NVME_RW_SUBMIT_CANDIDATES]
-    if nvme_hits:
-        for sym in NVME_RW_SUBMIT_CANDIDATES:
-            for hit in nvme_hits:
-                key = (hit.obj, hit.symbol)
-                if hit.symbol == sym and key not in seen:
-                    seen.add(key)
-                    selected.append(hit)
-                    break
-
-    if args.latency or not selected:
-        req_first = choose_first([h for h in submit_hits if h.symbol in REQUEST_SUBMIT_CANDIDATES], REQUEST_SUBMIT_CANDIDATES)
-        if req_first:
-            key = (req_first.obj, req_first.symbol)
-            if key not in seen:
-                seen.add(key)
-                selected.append(req_first)
-
-    if not selected:
-        first = choose_first(submit_hits, BDEV_SUBMIT_CANDIDATES)
-        if first:
-            selected.append(first)
-
-    return selected
 
 
 def print_size_counts(title: str, rows: Dict[int, int]) -> None:
@@ -529,104 +315,60 @@ def print_size_counts(title: str, rows: Dict[int, int]) -> None:
         print(f"  size_bytes={size:<12} count={rows[size]}")
 
 
+def attach_uprobe_compat(b, obj: str, sym: str, fn: str, pid: int) -> None:
+    try:
+        b.attach_uprobe(name=obj, sym=sym, fn_name=fn, pid=pid)
+    except TypeError:
+        b.attach_uprobe(name=obj, sym=sym, fn_name=fn)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="BCC uprobe observer for SPDK userspace NVMe/vfio IO paths")
-    parser.add_argument("--mode", choices=["spdk"], default="spdk", help="observer mode; this script implements spdk mode")
-    parser.add_argument("--pid", type=int, help="SPDK process pid; limits uprobes when supported by BCC")
-    parser.add_argument("--binary", required=True, help="path to nvmf_tgt, spdk_tgt, or target process executable")
-    parser.add_argument("--spdk-build-dir", help="SPDK build directory to scan for libspdk_*.so")
+    parser = argparse.ArgumentParser(description="BCC uprobe observer for validated SPDK bdev_nvme_submit_request IO path")
+    parser.add_argument("--pid", type=int, help="SPDK target pid; auto-detected from nvmf_tgt/spdk_tgt when omitted")
+    parser.add_argument("--binary", help="path to nvmf_tgt/spdk_tgt executable; auto-detected from /proc/<pid>/exe when omitted")
+    parser.add_argument("--submit-symbol", default=SUBMIT_SYMBOL, help="submit symbol to attach; default bdev_nvme_submit_request")
     parser.add_argument("--device-map", type=parse_device_map, default={}, help="optional comma-separated key=name map, e.g. 0xb3c...=Nvme0n1")
-    parser.add_argument("--auto-device-names", action="store_true", help="resolve unseen nonzero device_key values to SPDK bdev names through gdb and cache them")
-    parser.add_argument("--gdb-path", default="gdb", help="gdb executable for --auto-device-names")
+    parser.add_argument("--no-auto-device-names", action="store_true", help="disable automatic SPDK bdev name resolution through gdb")
+    parser.add_argument("--gdb-path", default="gdb", help="gdb executable for automatic device-name resolution")
     parser.add_argument("--device-name-timeout", type=float, default=3.0, help="seconds to wait for each gdb device-name lookup")
     parser.add_argument("--interval", type=float, default=1.0, help="print interval in seconds")
-    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON lines")
+    parser.add_argument("--json", action="store_true", help="emit JSON lines")
     parser.add_argument("--hist", action="store_true", help="print log2 size histogram")
-    parser.add_argument("--size-counts", action="store_true", help="print exact IO size byte counts, e.g. 4096 -> count")
-    parser.add_argument("--latency", action="store_true", help="attempt pointer-based submit/complete latency")
-    parser.add_argument("--symbols-auto-detect", action="store_true", help="deprecated no-op; symbol auto-detection is the default")
-    parser.add_argument("--submit-symbol", help="manual submit symbol; attaches to --binary unless symbol is discovered elsewhere")
-    parser.add_argument("--complete-symbol", help="manual completion symbol for latency")
-    parser.add_argument("--submit-object", help="object path for --submit-symbol when the symbol is not in --binary")
-    parser.add_argument("--complete-object", help="object path for --complete-symbol when the symbol is not in --binary")
-    parser.add_argument("--req-submit-arg", type=int, default=1, choices=[1, 2, 3, 4, 5, 6], help="argument index containing request pointer for generic request-level submit symbols")
-    parser.add_argument("--req-complete-arg", type=int, default=1, choices=[1, 2, 3, 4, 5, 6], help="argument index containing request pointer for completion symbols")
-    parser.add_argument("--lba-size", type=int, default=512, help="logical block size used for lba_count-to-byte conversion")
-    parser.add_argument("--bdev-io-bdev-offset", type=parse_int_auto, default=0x0, help="offset of struct spdk_bdev_io.bdev/device pointer; accepts hex, default 0x0")
-    parser.add_argument("--bdev-io-type-offset", type=parse_int_auto, default=0x8, help="offset of struct spdk_bdev_io.type; accepts hex, default 0x8")
-    parser.add_argument("--bdev-io-num-blocks-offset", type=parse_int_auto, default=0x250, help="offset of struct spdk_bdev_io.u.bdev.num_blocks; accepts hex, default 0x250")
-    parser.add_argument("--bdev-io-read-type", type=parse_int_auto, default=1, help="SPDK_BDEV_IO_TYPE_READ numeric value, default 1")
-    parser.add_argument("--bdev-io-write-type", type=parse_int_auto, default=2, help="SPDK_BDEV_IO_TYPE_WRITE numeric value, default 2")
-    parser.add_argument("--list-symbols", action="store_true", help="list discovered candidate symbols and exit")
-    parser.add_argument("--dry-run", action="store_true", help="show selected attach points without attaching")
+    parser.add_argument("--no-size-counts", action="store_true", help="disable exact IO size byte counts; enabled by default")
+    parser.add_argument("--lba-size", type=int, default=512, help="logical block size used for block-to-byte conversion")
+    parser.add_argument("--bdev-io-bdev-offset", type=parse_int_auto, default=0x0, help="offset of struct spdk_bdev_io.bdev/device pointer")
+    parser.add_argument("--bdev-io-type-offset", type=parse_int_auto, default=0x8, help="offset of struct spdk_bdev_io.type")
+    parser.add_argument("--bdev-io-num-blocks-offset", type=parse_int_auto, default=0x250, help="offset of struct spdk_bdev_io.u.bdev.num_blocks")
+    parser.add_argument("--bdev-io-read-type", type=parse_int_auto, default=1, help="SPDK_BDEV_IO_TYPE_READ numeric value")
+    parser.add_argument("--bdev-io-write-type", type=parse_int_auto, default=2, help="SPDK_BDEV_IO_TYPE_WRITE numeric value")
+    parser.add_argument("--dry-run", action="store_true", help="show selected attach plan without attaching")
     args = parser.parse_args()
 
     require_root()
     for msg in diagnostics():
         print(f"diagnostic: {msg}", file=sys.stderr)
 
-    if args.auto_device_names and not args.pid:
-        parser.error("--auto-device-names requires --pid because gdb must attach to the SPDK process")
-
-    objects = iter_elf_objects(args.binary, args.spdk_build_dir)
-    if not objects:
-        parser.error("no binary/shared library objects found")
-
-    submit_candidates = BDEV_NVME_STRUCT_SIZE_CANDIDATES + BDEV_NVME_SIZE_CANDIDATES + NVME_SUBMIT_CANDIDATES + BDEV_SUBMIT_CANDIDATES + REQUEST_SUBMIT_CANDIDATES
-    submit_hits = discover_symbols(objects, submit_candidates)
-    complete_hits = discover_symbols(objects, COMPLETE_CANDIDATES)
-
-    if args.list_symbols:
-        describe_hits("submit candidates:", submit_hits)
-        describe_hits("completion candidates:", complete_hits)
-        print("note: bdev_nvme_submit_request is preferred when present because it exposes struct spdk_bdev_io for read/write size/device accounting via offsets.", file=sys.stderr)
-        return 0
-
-    selected_submit_hits = select_submit_hits(args, objects, submit_hits)
-    submit_hit = selected_submit_hits[0] if selected_submit_hits else None
-    complete_hit = manual_hit(args.complete_symbol, objects, args.complete_object) if args.complete_symbol else choose_first(complete_hits, COMPLETE_CANDIDATES)
-    if not submit_hit:
-        print("error: no attachable SPDK submit symbol found", file=sys.stderr)
-        print("try: rebuild SPDK with debug symbols, disable LTO, do not strip binaries, or add a noinline wrapper/USDT tracepoint", file=sys.stderr)
-        return 2
-
-    manual_vector = bool(args.submit_symbol and args.submit_symbol in NVME_VECTOR_SUBMIT_CANDIDATES)
-    if manual_vector:
-        print("warning: manual public NVMe readv/writev attach requested; byte accounting assumes arg5 is lba_count and must be verified against your SPDK headers", file=sys.stderr)
-
-    latency_submit_hits = [h for h in selected_submit_hits if h.symbol not in NVME_SUBMIT_CANDIDATES and h.symbol not in BDEV_NVME_SIZE_CANDIDATES and h.symbol not in BDEV_NVME_STRUCT_SIZE_CANDIDATES]
-    nvme_api_submit = all(h.symbol in NVME_SUBMIT_CANDIDATES for h in selected_submit_hits)
-    latency_supported = args.latency and bool(complete_hit) and bool(latency_submit_hits)
-    if args.latency and not latency_supported:
-        reason = "selected size-capable submit symbol does not expose a stable per-IO request pointer" if not nvme_api_submit else "NVMe API submit symbols do not expose a stable per-IO request pointer"
-        print(f"warning: latency unsupported because {reason}; submit counts remain available", file=sys.stderr)
-
-    mode = selected_mode(selected_submit_hits, latency_supported)
-    zero_byte_fallback = mode in {"pointer-only-no-size", "request-pointer-latency"}
-
-    if zero_byte_fallback:
-        print("warning: selected submit path is pointer-only; bytes, avg_size, size histogram, and size counts are unsupported for this attach mode", file=sys.stderr)
+    pid = args.pid or auto_pid()
+    if not pid:
+        parser.error("could not auto-detect SPDK target pid; pass --pid")
+    binary = args.binary or auto_binary(pid)
+    if not binary:
+        parser.error("could not auto-detect SPDK target binary; pass --binary")
+    size_counts_enabled = not args.no_size_counts
+    auto_device_names = not args.no_auto_device_names
 
     selected = {
-        "submit": [h.__dict__ for h in selected_submit_hits],
-        "complete": complete_hit.__dict__ if complete_hit else None,
-        "pid": args.pid,
-        "lba_size": args.lba_size,
-        "latency_supported": latency_supported,
-        "mode": mode,
-        "bytes_supported": not zero_byte_fallback,
-        "size_hist_supported": not zero_byte_fallback,
-        "size_counts_supported": not zero_byte_fallback,
-        "device_key": "bdev_io + bdev_io_bdev_offset for bdev_nvme_submit_request; 0 for fallback symbols",
-        "device_map": args.device_map,
-        "auto_device_names": args.auto_device_names,
-        "req_submit_arg": args.req_submit_arg,
-        "req_complete_arg": args.req_complete_arg,
-        "bdev_io_bdev_offset": args.bdev_io_bdev_offset,
-        "bdev_io_type_offset": args.bdev_io_type_offset,
-        "bdev_io_num_blocks_offset": args.bdev_io_num_blocks_offset,
-        "bdev_io_read_type": args.bdev_io_read_type,
-        "bdev_io_write_type": args.bdev_io_write_type,
+        "pid": pid,
+        "binary": binary,
+        "submit_symbol": args.submit_symbol,
+        "size_counts_enabled": size_counts_enabled,
+        "auto_device_names": auto_device_names,
+        "device_key": "*(struct spdk_bdev_io + bdev_io_bdev_offset)",
+        "offsets": {
+            "bdev_io_bdev_offset": args.bdev_io_bdev_offset,
+            "bdev_io_type_offset": args.bdev_io_type_offset,
+            "bdev_io_num_blocks_offset": args.bdev_io_num_blocks_offset,
+        },
     }
     if args.dry_run:
         print(json_dumps(selected))
@@ -638,47 +380,16 @@ def main() -> int:
         print(f"failed to import BCC: {exc}", file=sys.stderr)
         return 2
 
-    b = BPF(text=build_bpf_text(
-        latency_supported,
-        args.lba_size,
-        args.req_submit_arg,
-        args.req_complete_arg,
-        args.bdev_io_bdev_offset,
-        args.bdev_io_type_offset,
-        args.bdev_io_num_blocks_offset,
-        args.bdev_io_read_type,
-        args.bdev_io_write_type,
-    ))
-    pid = args.pid if args.pid is not None else -1
-    attached = []
-    submit_fn_map = {
-        "bdev_nvme_submit_request": "trace_bdev_nvme_submit_request",
-        "bdev_nvme_readv": "trace_bdev_nvme_readv",
-        "bdev_nvme_writev": "trace_bdev_nvme_writev",
-        "spdk_nvme_ns_cmd_read": "trace_nvme_read",
-        "spdk_nvme_ns_cmd_write": "trace_nvme_write",
-        "spdk_nvme_ns_cmd_readv": "trace_nvme_read",
-        "spdk_nvme_ns_cmd_writev": "trace_nvme_write",
-    }
+    b = BPF(text=build_bpf_text(args))
     try:
-        for hit in selected_submit_hits:
-            fn = submit_fn_map.get(hit.symbol)
-            if fn is None:
-                fn = "trace_req_submit" if hit.symbol in REQUEST_SUBMIT_CANDIDATES or args.submit_symbol else "trace_bdev_submit"
-            attach_uprobe_compat(b, hit.obj, hit.symbol, fn, pid)
-            attached.append(f"{hit.symbol}@{hit.obj}->{fn}")
-        if latency_supported and complete_hit:
-            attach_uprobe_compat(b, complete_hit.obj, complete_hit.symbol, "trace_complete", pid)
-            attached.append(f"{complete_hit.symbol}@{complete_hit.obj}->trace_complete")
+        attach_uprobe_compat(b, binary, args.submit_symbol, "trace_bdev_nvme_submit_request", pid)
     except Exception as exc:
         print(f"attach failed: {exc}", file=sys.stderr)
-        print("alternatives: include debug symbols, disable LTO, avoid strip, use SPDK tracepoints/USDT, or add __attribute__((noinline)) wrapper symbols", file=sys.stderr)
+        print("check --binary, --submit-symbol, debug symbols, strip/LTO, or pass the exact executable path", file=sys.stderr)
         return 2
 
-    print("attached: " + ", ".join(attached), file=sys.stderr)
-    print(f"mode={mode} bytes_supported={not zero_byte_fallback} latency_supported={latency_supported} device_key=bdev", file=sys.stderr)
-    if args.auto_device_names:
-        print("auto_device_names=enabled resolver=gdb note='each new device_key briefly attaches gdb to resolve struct spdk_bdev.name'", file=sys.stderr)
+    print(f"attached: {args.submit_symbol}@{binary}->trace_bdev_nvme_submit_request", file=sys.stderr)
+    print(f"mode=spdk-bdev-nvme-submit-request pid={pid} binary={binary} size_counts={size_counts_enabled} auto_device_names={auto_device_names}", file=sys.stderr)
 
     device_map = dict(args.device_map)
     unresolved_device_keys = set()
@@ -686,15 +397,15 @@ def main() -> int:
     def label_for(device_key: int) -> str:
         if device_key in device_map:
             return device_map[device_key]
-        if args.auto_device_names and device_key != 0 and device_key not in unresolved_device_keys:
-            name = resolve_bdev_name_with_gdb(args.pid or 0, device_key, args.gdb_path, args.device_name_timeout)
+        if auto_device_names and device_key != 0 and device_key not in unresolved_device_keys:
+            name = resolve_bdev_name_with_gdb(pid, device_key, args.gdb_path, args.device_name_timeout)
             if name:
                 device_map[device_key] = name
                 print(f"resolved_device device_key=0x{device_key:x} name={name}", file=sys.stderr)
                 return name
             unresolved_device_keys.add(device_key)
             print(f"warning: failed to resolve device_key=0x{device_key:x} via gdb", file=sys.stderr)
-        return device_label(device_key, device_map)
+        return f"0x{device_key:x}"
 
     stop = False
 
@@ -704,22 +415,21 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
-    prev_stats, prev_size_hist, prev_size_counts, prev_lat = {}, {}, {}, {}
+
+    prev_stats, prev_hist, prev_size_counts = {}, {}, {}
     summary: Dict[Tuple[int, int, int], Tuple[int, int]] = {}
     summary_size_counts: Dict[Tuple[int, int, int, int], int] = {}
 
     while not stop:
         time.sleep(args.interval)
         names = thread_names(b["thread_names"])
-        now_stats = snapshot_hash(b["stats"])
-        now_size_hist = snapshot_hist(b["size_hist"])
+        now_stats = snapshot_stats(b["stats"])
+        now_hist = snapshot_hist(b["size_hist"])
         now_size_counts = snapshot_size_counts(b["size_counts"])
-        now_lat = snapshot_hist(b["lat_hist"])
         d_stats = delta_stats(now_stats, prev_stats)
-        d_size_hist = delta_counts(now_size_hist, prev_size_hist)
+        d_hist = delta_counts(now_hist, prev_hist)
         d_size_counts = delta_counts(now_size_counts, prev_size_counts)
-        d_lat = delta_counts(now_lat, prev_lat)
-        prev_stats, prev_size_hist, prev_size_counts, prev_lat = now_stats, now_size_hist, now_size_counts, now_lat
+        prev_stats, prev_hist, prev_size_counts = now_stats, now_hist, now_size_counts
 
         for key, val in d_stats.items():
             old = summary.get(key, (0, 0))
@@ -730,62 +440,53 @@ def main() -> int:
         if args.json:
             rows = []
             for (device_key, op, tid), (ios, bytes_) in sorted(d_stats.items()):
-                row = {"device_key": f"0x{device_key:x}", "device": label_for(device_key), "op": OP_NAMES.get(op, "other"), "tid": tid, "thread": names.get(tid, ""), "ios": ios}
-                if not zero_byte_fallback:
-                    row.update({"bytes": bytes_, "avg_size": (bytes_ / ios if ios else 0)})
-                else:
-                    row.update({"bytes": None, "avg_size": None})
-                rows.append(row)
+                rows.append({
+                    "device_key": f"0x{device_key:x}",
+                    "device": label_for(device_key),
+                    "op": OP_NAMES.get(op, "other"),
+                    "tid": tid,
+                    "thread": names.get(tid, ""),
+                    "ios": ios,
+                    "bytes": bytes_,
+                    "avg_size": bytes_ / ios if ios else 0,
+                })
             size_rows = []
-            if not zero_byte_fallback:
+            if size_counts_enabled:
                 for (device_key, op, tid, size), count in sorted(d_size_counts.items()):
-                    size_rows.append({"device_key": f"0x{device_key:x}", "device": label_for(device_key), "op": OP_NAMES.get(op, "other"), "tid": tid, "thread": names.get(tid, ""), "size_bytes": size, "count": count})
-            print(json_dumps({"ts": time.time(), "interval": args.interval, "stats": rows, "size_counts": size_rows, "mode": mode, "latency_supported": latency_supported}))
+                    size_rows.append({
+                        "device_key": f"0x{device_key:x}",
+                        "device": label_for(device_key),
+                        "op": OP_NAMES.get(op, "other"),
+                        "tid": tid,
+                        "thread": names.get(tid, ""),
+                        "size_bytes": size,
+                        "count": count,
+                    })
+            print(json_dumps({"ts": time.time(), "interval": args.interval, "stats": rows, "size_counts": size_rows, "mode": "spdk-bdev-nvme-submit-request"}))
             continue
 
         print(time.strftime("%H:%M:%S"))
         for (device_key, op, tid), (ios, bytes_) in sorted(d_stats.items()):
-            label = label_for(device_key)
-            if zero_byte_fallback:
-                print(f"device={label:<18} device_key=0x{device_key:x} tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes=unsupported avg_size=unsupported")
-            else:
-                avg = bytes_ / ios if ios else 0
-                print(f"device={label:<18} device_key=0x{device_key:x} tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes={bytes_:<12} avg_size={avg:.1f}")
+            avg = bytes_ / ios if ios else 0
+            print(f"device={label_for(device_key):<18} device_key=0x{device_key:x} tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes={bytes_:<12} avg_size={avg:.1f}")
 
-        if args.hist and not zero_byte_fallback:
-            for device_key, op, tid in sorted({(dev, op, tid) for dev, op, tid, _ in d_size_hist}):
-                label = label_for(device_key)
-                rows = {slot: cnt for (dev, o, t, slot), cnt in d_size_hist.items() if dev == device_key and o == op and t == tid}
-                print_log2_hist(f"size_hist device={label} device_key=0x{device_key:x} tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows, "bytes")
-        elif args.hist and zero_byte_fallback:
-            print("size histogram unsupported for pointer-only attach mode")
+        if args.hist:
+            for device_key, op, tid in sorted({(dev, op, tid) for dev, op, tid, _ in d_hist}):
+                rows = {slot: cnt for (dev, o, t, slot), cnt in d_hist.items() if dev == device_key and o == op and t == tid}
+                print_log2_hist(f"size_hist device={label_for(device_key)} device_key=0x{device_key:x} tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows, "bytes")
 
-        if args.size_counts and not zero_byte_fallback:
+        if size_counts_enabled:
             for device_key, op, tid in sorted({(dev, op, tid) for dev, op, tid, _ in d_size_counts}):
-                label = label_for(device_key)
                 rows = {size: cnt for (dev, o, t, size), cnt in d_size_counts.items() if dev == device_key and o == op and t == tid}
-                print_size_counts(f"size_counts device={label} device_key=0x{device_key:x} tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows)
-        elif args.size_counts and zero_byte_fallback:
-            print("size counts unsupported for pointer-only attach mode")
-
-        if latency_supported:
-            for device_key, op, tid in sorted({(dev, op, tid) for dev, op, tid, _ in d_lat}):
-                label = label_for(device_key)
-                rows = {slot: cnt for (dev, o, t, slot), cnt in d_lat.items() if dev == device_key and o == op and t == tid}
-                print_log2_hist(f"latency device={label} device_key=0x{device_key:x} tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows, "usec")
+                print_size_counts(f"size_counts device={label_for(device_key)} device_key=0x{device_key:x} tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows)
 
     print("summary", file=sys.stderr)
     for (device_key, op, tid), (ios, bytes_) in sorted(summary.items()):
-        label = label_for(device_key)
-        if zero_byte_fallback:
-            print(f"device={label} device_key=0x{device_key:x} tid={tid} {OP_NAMES.get(op, 'other')} ios={ios} bytes=unsupported", file=sys.stderr)
-        else:
-            print(f"device={label} device_key=0x{device_key:x} tid={tid} {OP_NAMES.get(op, 'other')} ios={ios} bytes={bytes_}", file=sys.stderr)
-    if args.size_counts and not zero_byte_fallback:
+        print(f"device={label_for(device_key)} device_key=0x{device_key:x} tid={tid} {OP_NAMES.get(op, 'other')} ios={ios} bytes={bytes_}", file=sys.stderr)
+    if size_counts_enabled:
         print("summary_size_counts", file=sys.stderr)
         for (device_key, op, tid, size), count in sorted(summary_size_counts.items()):
-            label = label_for(device_key)
-            print(f"device={label} device_key=0x{device_key:x} tid={tid} {OP_NAMES.get(op, 'other')} size_bytes={size} count={count}", file=sys.stderr)
+            print(f"device={label_for(device_key)} device_key=0x{device_key:x} tid={tid} {OP_NAMES.get(op, 'other')} size_bytes={size} count={count}", file=sys.stderr)
     return 0
 
 
