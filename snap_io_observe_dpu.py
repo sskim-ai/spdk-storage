@@ -26,8 +26,8 @@ OP_NAMES = {OP_READ: "read", OP_WRITE: "write"}
 MODE_DPU_RDMA_ZC_DONE = 6
 MODE_NAMES = {MODE_DPU_RDMA_ZC_DONE: "dpu-rdma-zc-done"}
 
-# Fast paths discovered on the current SNAP layout. They are intentionally kept
-# as best-effort accelerators; the generic depth-2 scan below is the fallback.
+# Fast paths discovered on the current SNAP layout. Generic scanning is kept as
+# an explicit diagnostic mode only because it can produce false positives.
 DEFAULT_NAME_CHAINS = [
     (0x58, 0x60, 0x180),      # ps1010_skh1n1
     (0x248, 0x2460, 0x0),     # micron1n1 candidate
@@ -210,7 +210,7 @@ def generic_depth2_scan(pid: int, ctrl: int, maps, root_max: int, mid_max: int, 
     return None
 
 
-def resolve_dpu_bdev_name(pid: int, ctrl: int, chains, maps, debug: bool = False, generic: bool = True, generic_root_max: int = 0x400, generic_mid_max: int = 0x3000, generic_name_offsets=None) -> Optional[str]:
+def resolve_dpu_bdev_name(pid: int, ctrl: int, chains, maps, debug: bool = False, generic: bool = False, generic_root_max: int = 0x400, generic_mid_max: int = 0x3000, generic_name_offsets=None) -> Optional[str]:
     if pid <= 0 or ctrl == 0:
         return None
     for root_off, mid_off, name_off in chains:
@@ -244,7 +244,7 @@ def device_label(device_key: int, device_map: Dict[int, str], pid: int, args, ma
             args.name_chains,
             maps,
             args.debug_resolve,
-            not args.no_generic_name_scan,
+            args.generic_name_scan,
             args.generic_root_max,
             args.generic_mid_max,
             args.generic_name_offsets,
@@ -349,7 +349,7 @@ def parse_args():
     parser.add_argument("--no-auto-device-names", action="store_true", help="disable automatic ctrl->backend bdev name resolution")
     parser.add_argument("--debug-resolve", action="store_true", help="print every automatic device-name resolution attempt")
     parser.add_argument("--name-chains", type=parse_name_chains, default=DEFAULT_NAME_CHAINS, help="comma-separated root_off:mid_off:name_off chains; default includes validated fast paths")
-    parser.add_argument("--no-generic-name-scan", action="store_true", help="disable generic depth-2 fallback name scan")
+    parser.add_argument("--generic-name-scan", action="store_true", help="enable experimental generic depth-2 fallback name scan; can produce false positives")
     parser.add_argument("--generic-root-max", type=parse_int_auto, default=0x400, help="bytes to scan from ctrl for generic name fallback")
     parser.add_argument("--generic-mid-max", type=parse_int_auto, default=0x3000, help="bytes to scan from mid objects for generic name fallback")
     parser.add_argument("--generic-name-offsets", type=parse_offset_list, default=DEFAULT_GENERIC_NAME_OFFSETS, help="comma-separated backend name offsets for generic fallback")
@@ -378,7 +378,7 @@ def main() -> int:
     auto_names = not args.no_auto_device_names
     proc_maps = parse_proc_maps(pid) if auto_names else []
     device_map = dict(args.device_map); failed_log = set(); seen_device_keys = set()
-    selected = {"mode": "dpu-snap-rdma-zc-done", "pid": pid, "binary": binary, "size_counts_enabled": size_counts_enabled, "auto_device_names": auto_names, "debug_resolve": args.debug_resolve, "name_chains": [tuple(hex(x) for x in c) for c in args.name_chains], "generic_name_scan": not args.no_generic_name_scan, "generic_root_max": hex(args.generic_root_max), "generic_mid_max": hex(args.generic_mid_max), "generic_name_offsets": [hex(x) for x in args.generic_name_offsets]}
+    selected = {"mode": "dpu-snap-rdma-zc-done", "pid": pid, "binary": binary, "size_counts_enabled": size_counts_enabled, "auto_device_names": auto_names, "debug_resolve": args.debug_resolve, "name_chains": [tuple(hex(x) for x in c) for c in args.name_chains], "generic_name_scan": args.generic_name_scan, "generic_root_max": hex(args.generic_root_max), "generic_mid_max": hex(args.generic_mid_max), "generic_name_offsets": [hex(x) for x in args.generic_name_offsets]}
     if args.dry_run: print(json_dumps(selected)); return 0
     try:
         from bcc import BPF
