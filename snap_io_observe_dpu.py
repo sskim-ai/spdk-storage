@@ -26,15 +26,10 @@ OP_NAMES = {OP_READ: "read", OP_WRITE: "write"}
 MODE_DPU_RDMA_ZC_DONE = 6
 MODE_NAMES = {MODE_DPU_RDMA_ZC_DONE: "dpu-rdma-zc-done"}
 
-# Validated DPU controller -> backend bdev-name chains.
-# Format: root_off, mid_off, name_off.
-#   mid     = *(ctrl + root_off)
-#   backend = *(mid + mid_off)
-#   name    = (char *)(backend + name_off)
 DEFAULT_NAME_CHAINS = [
-    (0x58, 0x60, 0x180),      # ps1010_skh1n1
-    (0x248, 0x2460, 0x0),     # micron1n1
-    (0x260, 0x2460, 0x0),     # micron1n1 alternate
+    (0x58, 0x60, 0x180),
+    (0x248, 0x2460, 0x0),
+    (0x260, 0x2460, 0x0),
 ]
 BDEV_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]*[A-Za-z_][A-Za-z0-9_.:-]*n[0-9]+$")
 BAD_NAME_SUBSTRINGS = ("DPU OS", "Micron 9550", "SKHynix PS1010", "Controller", "model", "Model")
@@ -171,34 +166,38 @@ def looks_like_bdev_name(text: str) -> bool:
     return ("n1" in low or re.search(r"n[0-9]+$", low) is not None) and any(k in low for k in ("ps1010", "micron", "nvme", "skh"))
 
 
-def resolve_dpu_bdev_name(pid: int, ctrl: int, chains, maps) -> Optional[str]:
+def resolve_dpu_bdev_name(pid: int, ctrl: int, chains, maps, debug: bool = False) -> Optional[str]:
     if pid <= 0 or ctrl == 0:
         return None
     for root_off, mid_off, name_off in chains:
         mid = read_u64(pid, ctrl + root_off, maps)
-        if not mid:
-            continue
-        backend = read_u64(pid, mid + mid_off, maps)
-        if not backend:
-            continue
-        name = read_cstr(pid, backend + name_off, maps)
-        if name and looks_like_bdev_name(name):
+        backend = read_u64(pid, mid + mid_off, maps) if mid else None
+        name_addr = backend + name_off if backend else 0
+        name = read_cstr(pid, name_addr, maps) if backend else None
+        ok = bool(name and looks_like_bdev_name(name))
+        if debug:
+            print(
+                f"debug_resolve ctrl=0x{ctrl:x} root_off=0x{root_off:x} "
+                f"mid={('0x%x' % mid) if mid else 'None'} mid_off=0x{mid_off:x} "
+                f"backend={('0x%x' % backend) if backend else 'None'} name_off=0x{name_off:x} "
+                f"name_addr={('0x%x' % name_addr) if name_addr else 'None'} name={name!r} ok={ok}",
+                file=sys.stderr,
+            )
+        if ok:
             return name
     return None
 
 
-def device_label(device_key: int, device_map: Dict[int, str], pid: int, chains, maps, failed_log: set, auto_names: bool) -> str:
+def device_label(device_key: int, device_map: Dict[int, str], pid: int, chains, maps, failed_log: set, auto_names: bool, debug_resolve: bool) -> str:
     if device_key in device_map:
         return device_map[device_key]
     if auto_names and device_key:
-        name = resolve_dpu_bdev_name(pid, device_key, chains, maps)
+        name = resolve_dpu_bdev_name(pid, device_key, chains, maps, debug_resolve)
         if name:
             device_map[device_key] = name
             failed_log.discard(device_key)
             print(f"resolved_device device_key=0x{device_key:x} name={name}", file=sys.stderr)
             return name
-        # A controller can appear before every backend pointer is populated.
-        # Do not permanently suppress retries; only suppress repeated warnings.
         if device_key not in failed_log:
             failed_log.add(device_key)
             print(f"warning: failed to resolve dpu device_key=0x{device_key:x} through configured name chains; will retry", file=sys.stderr)
@@ -292,6 +291,7 @@ def parse_args():
     parser.add_argument("--binary", help="path to snap_service; auto-detected when omitted")
     parser.add_argument("--device-map", type=parse_device_map, default={}, help="optional comma-separated key=name map")
     parser.add_argument("--no-auto-device-names", action="store_true", help="disable automatic ctrl->backend bdev name resolution")
+    parser.add_argument("--debug-resolve", action="store_true", help="print every automatic device-name resolution attempt")
     parser.add_argument("--name-chains", type=parse_name_chains, default=DEFAULT_NAME_CHAINS, help="comma-separated root_off:mid_off:name_off chains; default includes validated PS1010/Micron paths")
     parser.add_argument("--interval", type=float, default=1.0, help="print interval in seconds")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON lines")
@@ -318,7 +318,7 @@ def main() -> int:
     auto_names = not args.no_auto_device_names
     proc_maps = parse_proc_maps(pid) if auto_names else []
     device_map = dict(args.device_map); failed_log = set(); seen_device_keys = set()
-    selected = {"mode": "dpu-snap-rdma-zc-done", "pid": pid, "binary": binary, "size_counts_enabled": size_counts_enabled, "auto_device_names": auto_names, "name_chains": [tuple(hex(x) for x in c) for c in args.name_chains]}
+    selected = {"mode": "dpu-snap-rdma-zc-done", "pid": pid, "binary": binary, "size_counts_enabled": size_counts_enabled, "auto_device_names": auto_names, "debug_resolve": args.debug_resolve, "name_chains": [tuple(hex(x) for x in c) for c in args.name_chains]}
     if args.dry_run: print(json_dumps(selected)); return 0
     try:
         from bcc import BPF
@@ -339,13 +339,15 @@ def main() -> int:
     prev_stats, prev_hist, prev_size_counts = {}, {}, {}
     summary_stats = {}; summary_size_counts = {}
     def label(dev):
-        return device_label(dev, device_map, pid, args.name_chains, proc_maps, failed_log, auto_names)
+        return device_label(dev, device_map, pid, args.name_chains, proc_maps, failed_log, auto_names, args.debug_resolve)
     def retry_seen_device_names():
         if not auto_names:
             return
-        for dev in sorted(seen_device_keys):
-            if dev and dev not in device_map:
-                label(dev)
+        pending = sorted(dev for dev in seen_device_keys if dev and dev not in device_map)
+        if args.debug_resolve and pending:
+            print("debug_resolve_retry pending=" + ",".join(f"0x{x:x}" for x in pending), file=sys.stderr)
+        for dev in pending:
+            label(dev)
     while not stop:
         time.sleep(args.interval)
         names = thread_names(b["thread_names"]); now_stats = snapshot_stats(b["stats"]); now_hist = snapshot_hist(b["size_hist"]); now_size_counts = snapshot_size_counts(b["size_counts"])
