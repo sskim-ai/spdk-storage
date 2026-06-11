@@ -26,10 +26,20 @@ OP_NAMES = {OP_READ: "read", OP_WRITE: "write"}
 MODE_DPU_RDMA_ZC_DONE = 6
 MODE_NAMES = {MODE_DPU_RDMA_ZC_DONE: "dpu-rdma-zc-done"}
 
+# Fast paths discovered on the current SNAP layout. They are intentionally kept
+# as best-effort accelerators; the generic depth-2 scan below is the fallback.
 DEFAULT_NAME_CHAINS = [
-    (0x58, 0x60, 0x180),
-    (0x248, 0x2460, 0x0),
-    (0x260, 0x2460, 0x0),
+    (0x58, 0x60, 0x180),      # ps1010_skh1n1
+    (0x248, 0x2460, 0x0),     # micron1n1 candidate
+    (0x260, 0x2460, 0x0),     # micron1n1 alternate candidate
+]
+DEFAULT_GENERIC_NAME_OFFSETS = [
+    0x0, 0x8, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38,
+    0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78,
+    0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xB8,
+    0xC0, 0xC8, 0xD0, 0xD8, 0xE0, 0xE8, 0xF0, 0xF8,
+    0x100, 0x120, 0x140, 0x180, 0x1C0, 0x200, 0x240,
+    0x280, 0x300, 0x380, 0x400, 0x480, 0x500,
 ]
 BDEV_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]*[A-Za-z_][A-Za-z0-9_.:-]*n[0-9]+$")
 BAD_NAME_SUBSTRINGS = ("DPU OS", "Micron 9550", "SKHynix PS1010", "Controller", "model", "Model")
@@ -67,6 +77,12 @@ def parse_name_chains(value: str):
             raise argparse.ArgumentTypeError("name chain entries must be root_off:mid_off:name_off")
         chains.append(tuple(int(p, 0) for p in parts))
     return chains
+
+
+def parse_offset_list(value: str):
+    if not value:
+        return []
+    return [int(item.strip(), 0) for item in value.split(",") if item.strip()]
 
 
 def run_text(cmd: Iterable[str], timeout: float = 2.0) -> str:
@@ -166,7 +182,35 @@ def looks_like_bdev_name(text: str) -> bool:
     return ("n1" in low or re.search(r"n[0-9]+$", low) is not None) and any(k in low for k in ("ps1010", "micron", "nvme", "skh"))
 
 
-def resolve_dpu_bdev_name(pid: int, ctrl: int, chains, maps, debug: bool = False) -> Optional[str]:
+def generic_depth2_scan(pid: int, ctrl: int, maps, root_max: int, mid_max: int, name_offsets, debug: bool = False) -> Optional[str]:
+    if debug:
+        print(f"debug_generic_scan_start ctrl=0x{ctrl:x} root_max=0x{root_max:x} mid_max=0x{mid_max:x}", file=sys.stderr)
+    for root_off in range(0, root_max, 8):
+        mid = read_u64(pid, ctrl + root_off, maps)
+        if not mid or not readable(mid, 8, maps):
+            continue
+        for mid_off in range(0, mid_max, 8):
+            backend = read_u64(pid, mid + mid_off, maps)
+            if not backend or not readable(backend, 1, maps):
+                continue
+            for name_off in name_offsets:
+                name_addr = backend + name_off
+                name = read_cstr(pid, name_addr, maps)
+                if name and looks_like_bdev_name(name):
+                    if debug:
+                        print(
+                            f"debug_generic_hit ctrl=0x{ctrl:x} root_off=0x{root_off:x} "
+                            f"mid=0x{mid:x} mid_off=0x{mid_off:x} backend=0x{backend:x} "
+                            f"name_off=0x{name_off:x} name_addr=0x{name_addr:x} name={name!r}",
+                            file=sys.stderr,
+                        )
+                    return name
+    if debug:
+        print(f"debug_generic_scan_miss ctrl=0x{ctrl:x}", file=sys.stderr)
+    return None
+
+
+def resolve_dpu_bdev_name(pid: int, ctrl: int, chains, maps, debug: bool = False, generic: bool = True, generic_root_max: int = 0x400, generic_mid_max: int = 0x3000, generic_name_offsets=None) -> Optional[str]:
     if pid <= 0 or ctrl == 0:
         return None
     for root_off, mid_off, name_off in chains:
@@ -185,14 +229,26 @@ def resolve_dpu_bdev_name(pid: int, ctrl: int, chains, maps, debug: bool = False
             )
         if ok:
             return name
+    if generic:
+        return generic_depth2_scan(pid, ctrl, maps, generic_root_max, generic_mid_max, generic_name_offsets or DEFAULT_GENERIC_NAME_OFFSETS, debug)
     return None
 
 
-def device_label(device_key: int, device_map: Dict[int, str], pid: int, chains, maps, failed_log: set, auto_names: bool, debug_resolve: bool) -> str:
+def device_label(device_key: int, device_map: Dict[int, str], pid: int, args, maps, failed_log: set, auto_names: bool) -> str:
     if device_key in device_map:
         return device_map[device_key]
     if auto_names and device_key:
-        name = resolve_dpu_bdev_name(pid, device_key, chains, maps, debug_resolve)
+        name = resolve_dpu_bdev_name(
+            pid,
+            device_key,
+            args.name_chains,
+            maps,
+            args.debug_resolve,
+            not args.no_generic_name_scan,
+            args.generic_root_max,
+            args.generic_mid_max,
+            args.generic_name_offsets,
+        )
         if name:
             device_map[device_key] = name
             failed_log.discard(device_key)
@@ -292,7 +348,11 @@ def parse_args():
     parser.add_argument("--device-map", type=parse_device_map, default={}, help="optional comma-separated key=name map")
     parser.add_argument("--no-auto-device-names", action="store_true", help="disable automatic ctrl->backend bdev name resolution")
     parser.add_argument("--debug-resolve", action="store_true", help="print every automatic device-name resolution attempt")
-    parser.add_argument("--name-chains", type=parse_name_chains, default=DEFAULT_NAME_CHAINS, help="comma-separated root_off:mid_off:name_off chains; default includes validated PS1010/Micron paths")
+    parser.add_argument("--name-chains", type=parse_name_chains, default=DEFAULT_NAME_CHAINS, help="comma-separated root_off:mid_off:name_off chains; default includes validated fast paths")
+    parser.add_argument("--no-generic-name-scan", action="store_true", help="disable generic depth-2 fallback name scan")
+    parser.add_argument("--generic-root-max", type=parse_int_auto, default=0x400, help="bytes to scan from ctrl for generic name fallback")
+    parser.add_argument("--generic-mid-max", type=parse_int_auto, default=0x3000, help="bytes to scan from mid objects for generic name fallback")
+    parser.add_argument("--generic-name-offsets", type=parse_offset_list, default=DEFAULT_GENERIC_NAME_OFFSETS, help="comma-separated backend name offsets for generic fallback")
     parser.add_argument("--interval", type=float, default=1.0, help="print interval in seconds")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON lines")
     parser.add_argument("--hist", action="store_true", help="print log2 size histogram")
@@ -318,7 +378,7 @@ def main() -> int:
     auto_names = not args.no_auto_device_names
     proc_maps = parse_proc_maps(pid) if auto_names else []
     device_map = dict(args.device_map); failed_log = set(); seen_device_keys = set()
-    selected = {"mode": "dpu-snap-rdma-zc-done", "pid": pid, "binary": binary, "size_counts_enabled": size_counts_enabled, "auto_device_names": auto_names, "debug_resolve": args.debug_resolve, "name_chains": [tuple(hex(x) for x in c) for c in args.name_chains]}
+    selected = {"mode": "dpu-snap-rdma-zc-done", "pid": pid, "binary": binary, "size_counts_enabled": size_counts_enabled, "auto_device_names": auto_names, "debug_resolve": args.debug_resolve, "name_chains": [tuple(hex(x) for x in c) for c in args.name_chains], "generic_name_scan": not args.no_generic_name_scan, "generic_root_max": hex(args.generic_root_max), "generic_mid_max": hex(args.generic_mid_max), "generic_name_offsets": [hex(x) for x in args.generic_name_offsets]}
     if args.dry_run: print(json_dumps(selected)); return 0
     try:
         from bcc import BPF
@@ -339,7 +399,7 @@ def main() -> int:
     prev_stats, prev_hist, prev_size_counts = {}, {}, {}
     summary_stats = {}; summary_size_counts = {}
     def label(dev):
-        return device_label(dev, device_map, pid, args.name_chains, proc_maps, failed_log, auto_names, args.debug_resolve)
+        return device_label(dev, device_map, pid, args, proc_maps, failed_log, auto_names)
     def retry_seen_device_names():
         if not auto_names:
             return
