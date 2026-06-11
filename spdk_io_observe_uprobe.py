@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import ctypes as ct
+import re
 import signal
+import subprocess
 import sys
 import time
 from typing import Dict, Tuple
@@ -104,6 +106,35 @@ def parse_device_map(value: str) -> Dict[int, str]:
         key_s, name = item.split("=", 1)
         out[int(key_s, 0)] = name
     return out
+
+
+def resolve_bdev_name_with_gdb(pid: int, device_key: int, gdb_path: str, timeout: float) -> str | None:
+    if pid <= 0 or device_key == 0:
+        return None
+    expr = f"((struct spdk_bdev *)0x{device_key:x})->name"
+    cmd = [
+        gdb_path,
+        "-q",
+        "-batch",
+        "-p",
+        str(pid),
+        "-ex",
+        "set pagination off",
+        "-ex",
+        f"x/s {expr}",
+        "-ex",
+        "detach",
+    ]
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    text = result.stdout or ""
+    matches = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', text)
+    if not matches:
+        return None
+    name = bytes(matches[-1], "utf-8").decode("unicode_escape", "replace")
+    return name or None
 
 
 def device_label(device_key: int, device_map: Dict[int, str]) -> str:
@@ -504,7 +535,10 @@ def main() -> int:
     parser.add_argument("--pid", type=int, help="SPDK process pid; limits uprobes when supported by BCC")
     parser.add_argument("--binary", required=True, help="path to nvmf_tgt, spdk_tgt, or target process executable")
     parser.add_argument("--spdk-build-dir", help="SPDK build directory to scan for libspdk_*.so")
-    parser.add_argument("--device-map", type=parse_device_map, default={}, help="optional comma-separated key=name map, e.g. 0xb3c...=nvme0")
+    parser.add_argument("--device-map", type=parse_device_map, default={}, help="optional comma-separated key=name map, e.g. 0xb3c...=Nvme0n1")
+    parser.add_argument("--auto-device-names", action="store_true", help="resolve unseen nonzero device_key values to SPDK bdev names through gdb and cache them")
+    parser.add_argument("--gdb-path", default="gdb", help="gdb executable for --auto-device-names")
+    parser.add_argument("--device-name-timeout", type=float, default=3.0, help="seconds to wait for each gdb device-name lookup")
     parser.add_argument("--interval", type=float, default=1.0, help="print interval in seconds")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON lines")
     parser.add_argument("--hist", action="store_true", help="print log2 size histogram")
@@ -530,6 +564,9 @@ def main() -> int:
     require_root()
     for msg in diagnostics():
         print(f"diagnostic: {msg}", file=sys.stderr)
+
+    if args.auto_device_names and not args.pid:
+        parser.error("--auto-device-names requires --pid because gdb must attach to the SPDK process")
 
     objects = iter_elf_objects(args.binary, args.spdk_build_dir)
     if not objects:
@@ -582,6 +619,7 @@ def main() -> int:
         "size_counts_supported": not zero_byte_fallback,
         "device_key": "bdev_io + bdev_io_bdev_offset for bdev_nvme_submit_request; 0 for fallback symbols",
         "device_map": args.device_map,
+        "auto_device_names": args.auto_device_names,
         "req_submit_arg": args.req_submit_arg,
         "req_complete_arg": args.req_complete_arg,
         "bdev_io_bdev_offset": args.bdev_io_bdev_offset,
@@ -639,6 +677,24 @@ def main() -> int:
 
     print("attached: " + ", ".join(attached), file=sys.stderr)
     print(f"mode={mode} bytes_supported={not zero_byte_fallback} latency_supported={latency_supported} device_key=bdev", file=sys.stderr)
+    if args.auto_device_names:
+        print("auto_device_names=enabled resolver=gdb note='each new device_key briefly attaches gdb to resolve struct spdk_bdev.name'", file=sys.stderr)
+
+    device_map = dict(args.device_map)
+    unresolved_device_keys = set()
+
+    def label_for(device_key: int) -> str:
+        if device_key in device_map:
+            return device_map[device_key]
+        if args.auto_device_names and device_key != 0 and device_key not in unresolved_device_keys:
+            name = resolve_bdev_name_with_gdb(args.pid or 0, device_key, args.gdb_path, args.device_name_timeout)
+            if name:
+                device_map[device_key] = name
+                print(f"resolved_device device_key=0x{device_key:x} name={name}", file=sys.stderr)
+                return name
+            unresolved_device_keys.add(device_key)
+            print(f"warning: failed to resolve device_key=0x{device_key:x} via gdb", file=sys.stderr)
+        return device_label(device_key, device_map)
 
     stop = False
 
@@ -674,7 +730,7 @@ def main() -> int:
         if args.json:
             rows = []
             for (device_key, op, tid), (ios, bytes_) in sorted(d_stats.items()):
-                row = {"device_key": f"0x{device_key:x}", "device": device_label(device_key, args.device_map), "op": OP_NAMES.get(op, "other"), "tid": tid, "thread": names.get(tid, ""), "ios": ios}
+                row = {"device_key": f"0x{device_key:x}", "device": label_for(device_key), "op": OP_NAMES.get(op, "other"), "tid": tid, "thread": names.get(tid, ""), "ios": ios}
                 if not zero_byte_fallback:
                     row.update({"bytes": bytes_, "avg_size": (bytes_ / ios if ios else 0)})
                 else:
@@ -683,47 +739,53 @@ def main() -> int:
             size_rows = []
             if not zero_byte_fallback:
                 for (device_key, op, tid, size), count in sorted(d_size_counts.items()):
-                    size_rows.append({"device_key": f"0x{device_key:x}", "device": device_label(device_key, args.device_map), "op": OP_NAMES.get(op, "other"), "tid": tid, "thread": names.get(tid, ""), "size_bytes": size, "count": count})
+                    size_rows.append({"device_key": f"0x{device_key:x}", "device": label_for(device_key), "op": OP_NAMES.get(op, "other"), "tid": tid, "thread": names.get(tid, ""), "size_bytes": size, "count": count})
             print(json_dumps({"ts": time.time(), "interval": args.interval, "stats": rows, "size_counts": size_rows, "mode": mode, "latency_supported": latency_supported}))
             continue
 
         print(time.strftime("%H:%M:%S"))
         for (device_key, op, tid), (ios, bytes_) in sorted(d_stats.items()):
+            label = label_for(device_key)
             if zero_byte_fallback:
-                print(f"device={device_label(device_key, args.device_map):<18} device_key=0x{device_key:x} tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes=unsupported avg_size=unsupported")
+                print(f"device={label:<18} device_key=0x{device_key:x} tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes=unsupported avg_size=unsupported")
             else:
                 avg = bytes_ / ios if ios else 0
-                print(f"device={device_label(device_key, args.device_map):<18} device_key=0x{device_key:x} tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes={bytes_:<12} avg_size={avg:.1f}")
+                print(f"device={label:<18} device_key=0x{device_key:x} tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, 'other'):<6} ios={ios:<10} bytes={bytes_:<12} avg_size={avg:.1f}")
 
         if args.hist and not zero_byte_fallback:
             for device_key, op, tid in sorted({(dev, op, tid) for dev, op, tid, _ in d_size_hist}):
+                label = label_for(device_key)
                 rows = {slot: cnt for (dev, o, t, slot), cnt in d_size_hist.items() if dev == device_key and o == op and t == tid}
-                print_log2_hist(f"size_hist device={device_label(device_key, args.device_map)} device_key=0x{device_key:x} tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows, "bytes")
+                print_log2_hist(f"size_hist device={label} device_key=0x{device_key:x} tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows, "bytes")
         elif args.hist and zero_byte_fallback:
             print("size histogram unsupported for pointer-only attach mode")
 
         if args.size_counts and not zero_byte_fallback:
             for device_key, op, tid in sorted({(dev, op, tid) for dev, op, tid, _ in d_size_counts}):
+                label = label_for(device_key)
                 rows = {size: cnt for (dev, o, t, size), cnt in d_size_counts.items() if dev == device_key and o == op and t == tid}
-                print_size_counts(f"size_counts device={device_label(device_key, args.device_map)} device_key=0x{device_key:x} tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows)
+                print_size_counts(f"size_counts device={label} device_key=0x{device_key:x} tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows)
         elif args.size_counts and zero_byte_fallback:
             print("size counts unsupported for pointer-only attach mode")
 
         if latency_supported:
             for device_key, op, tid in sorted({(dev, op, tid) for dev, op, tid, _ in d_lat}):
+                label = label_for(device_key)
                 rows = {slot: cnt for (dev, o, t, slot), cnt in d_lat.items() if dev == device_key and o == op and t == tid}
-                print_log2_hist(f"latency device={device_label(device_key, args.device_map)} device_key=0x{device_key:x} tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows, "usec")
+                print_log2_hist(f"latency device={label} device_key=0x{device_key:x} tid={tid} {names.get(tid, '')} {OP_NAMES.get(op, 'other')}", rows, "usec")
 
     print("summary", file=sys.stderr)
     for (device_key, op, tid), (ios, bytes_) in sorted(summary.items()):
+        label = label_for(device_key)
         if zero_byte_fallback:
-            print(f"device={device_label(device_key, args.device_map)} device_key=0x{device_key:x} tid={tid} {OP_NAMES.get(op, 'other')} ios={ios} bytes=unsupported", file=sys.stderr)
+            print(f"device={label} device_key=0x{device_key:x} tid={tid} {OP_NAMES.get(op, 'other')} ios={ios} bytes=unsupported", file=sys.stderr)
         else:
-            print(f"device={device_label(device_key, args.device_map)} device_key=0x{device_key:x} tid={tid} {OP_NAMES.get(op, 'other')} ios={ios} bytes={bytes_}", file=sys.stderr)
+            print(f"device={label} device_key=0x{device_key:x} tid={tid} {OP_NAMES.get(op, 'other')} ios={ios} bytes={bytes_}", file=sys.stderr)
     if args.size_counts and not zero_byte_fallback:
         print("summary_size_counts", file=sys.stderr)
         for (device_key, op, tid, size), count in sorted(summary_size_counts.items()):
-            print(f"device={device_label(device_key, args.device_map)} device_key=0x{device_key:x} tid={tid} {OP_NAMES.get(op, 'other')} size_bytes={size} count={count}", file=sys.stderr)
+            label = label_for(device_key)
+            print(f"device={label} device_key=0x{device_key:x} tid={tid} {OP_NAMES.get(op, 'other')} size_bytes={size} count={count}", file=sys.stderr)
     return 0
 
 
