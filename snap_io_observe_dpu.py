@@ -16,24 +16,22 @@ from typing import Dict, Iterable, Optional, Tuple
 
 from common import diagnostics, json_dumps, print_log2_hist, require_root
 
-READ_SYMBOL = "snap_bdev_spdk_rdma_zc_handle_read"
-WRITE_SYMBOL = "snap_bdev_spdk_rdma_zc_handle_write"
+READ_SYMBOL = "snap_bdev_spdk_rdma_zc_read_done"
+WRITE_SYMBOL = "snap_bdev_spdk_rdma_zc_write_done"
 DIR_EGRESS = 1
 DIR_NAMES = {DIR_EGRESS: "egress"}
 OP_READ = 0
 OP_WRITE = 1
 OP_NAMES = {OP_READ: "read", OP_WRITE: "write"}
-MODE_DPU_RDMA_ZC_HANDLE = 7
-MODE_NAMES = {MODE_DPU_RDMA_ZC_HANDLE: "dpu-rdma-zc-handle"}
+MODE_DPU_RDMA_ZC_DONE = 6
+MODE_NAMES = {MODE_DPU_RDMA_ZC_DONE: "dpu-rdma-zc-done"}
 
-# Fast paths discovered on older ctrl-based SNAP layouts. They are kept only
-# for explicit diagnostic/name experiments. The default device key is now the
-# RDMA-ZC handle devctx itself, which is arg0 of handle_read/handle_write and
-# matches the zc_ctx later observed by read_done/write_done.
+# Fast paths discovered on the current SNAP layout. Generic scanning is kept as
+# an explicit diagnostic mode only because it can produce false positives.
 DEFAULT_NAME_CHAINS = [
-    (0x58, 0x60, 0x180),
-    (0x248, 0x2460, 0x0),
-    (0x260, 0x2460, 0x0),
+    (0x58, 0x60, 0x180),      # ps1010_skh1n1
+    (0x248, 0x2460, 0x0),     # micron1n1 candidate
+    (0x260, 0x2460, 0x0),     # micron1n1 alternate candidate
 ]
 DEFAULT_GENERIC_NAME_OFFSETS = [
     0x0, 0x8, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38,
@@ -184,11 +182,11 @@ def looks_like_bdev_name(text: str) -> bool:
     return ("n1" in low or re.search(r"n[0-9]+$", low) is not None) and any(k in low for k in ("ps1010", "micron", "nvme", "skh"))
 
 
-def generic_depth2_scan(pid: int, devctx: int, maps, root_max: int, mid_max: int, name_offsets, debug: bool = False) -> Optional[str]:
+def generic_depth2_scan(pid: int, ctrl: int, maps, root_max: int, mid_max: int, name_offsets, debug: bool = False) -> Optional[str]:
     if debug:
-        print(f"debug_generic_scan_start devctx=0x{devctx:x} root_max=0x{root_max:x} mid_max=0x{mid_max:x}", file=sys.stderr)
+        print(f"debug_generic_scan_start ctrl=0x{ctrl:x} root_max=0x{root_max:x} mid_max=0x{mid_max:x}", file=sys.stderr)
     for root_off in range(0, root_max, 8):
-        mid = read_u64(pid, devctx + root_off, maps)
+        mid = read_u64(pid, ctrl + root_off, maps)
         if not mid or not readable(mid, 8, maps):
             continue
         for mid_off in range(0, mid_max, 8):
@@ -201,29 +199,29 @@ def generic_depth2_scan(pid: int, devctx: int, maps, root_max: int, mid_max: int
                 if name and looks_like_bdev_name(name):
                     if debug:
                         print(
-                            f"debug_generic_hit devctx=0x{devctx:x} root_off=0x{root_off:x} "
+                            f"debug_generic_hit ctrl=0x{ctrl:x} root_off=0x{root_off:x} "
                             f"mid=0x{mid:x} mid_off=0x{mid_off:x} backend=0x{backend:x} "
                             f"name_off=0x{name_off:x} name_addr=0x{name_addr:x} name={name!r}",
                             file=sys.stderr,
                         )
                     return name
     if debug:
-        print(f"debug_generic_scan_miss devctx=0x{devctx:x}", file=sys.stderr)
+        print(f"debug_generic_scan_miss ctrl=0x{ctrl:x}", file=sys.stderr)
     return None
 
 
-def resolve_dpu_bdev_name(pid: int, devctx: int, chains, maps, debug: bool = False, generic: bool = False, generic_root_max: int = 0x400, generic_mid_max: int = 0x3000, generic_name_offsets=None) -> Optional[str]:
-    if pid <= 0 or devctx == 0:
+def resolve_dpu_bdev_name(pid: int, ctrl: int, chains, maps, debug: bool = False, generic: bool = False, generic_root_max: int = 0x400, generic_mid_max: int = 0x3000, generic_name_offsets=None) -> Optional[str]:
+    if pid <= 0 or ctrl == 0:
         return None
     for root_off, mid_off, name_off in chains:
-        mid = read_u64(pid, devctx + root_off, maps)
+        mid = read_u64(pid, ctrl + root_off, maps)
         backend = read_u64(pid, mid + mid_off, maps) if mid else None
         name_addr = backend + name_off if backend else 0
         name = read_cstr(pid, name_addr, maps) if backend else None
         ok = bool(name and looks_like_bdev_name(name))
         if debug:
             print(
-                f"debug_resolve devctx=0x{devctx:x} root_off=0x{root_off:x} "
+                f"debug_resolve ctrl=0x{ctrl:x} root_off=0x{root_off:x} "
                 f"mid={('0x%x' % mid) if mid else 'None'} mid_off=0x{mid_off:x} "
                 f"backend={('0x%x' % backend) if backend else 'None'} name_off=0x{name_off:x} "
                 f"name_addr={('0x%x' % name_addr) if name_addr else 'None'} name={name!r} ok={ok}",
@@ -232,7 +230,7 @@ def resolve_dpu_bdev_name(pid: int, devctx: int, chains, maps, debug: bool = Fal
         if ok:
             return name
     if generic:
-        return generic_depth2_scan(pid, devctx, maps, generic_root_max, generic_mid_max, generic_name_offsets or DEFAULT_GENERIC_NAME_OFFSETS, debug)
+        return generic_depth2_scan(pid, ctrl, maps, generic_root_max, generic_mid_max, generic_name_offsets or DEFAULT_GENERIC_NAME_OFFSETS, debug)
     return None
 
 
@@ -258,12 +256,12 @@ def device_label(device_key: int, device_map: Dict[int, str], pid: int, args, ma
             return name
         if device_key not in failed_log:
             failed_log.add(device_key)
-            print(f"warning: failed to resolve dpu device_key=0x{device_key:x}; use --device-map for stable names or --generic-name-scan for diagnostics", file=sys.stderr)
+            print(f"warning: failed to resolve dpu device_key=0x{device_key:x} through configured name chains; will retry", file=sys.stderr)
     return f"0x{device_key:x}"
 
 
 def arg_expr(n: int) -> str:
-    return {1: "PT_REGS_PARM1(ctx)", 2: "PT_REGS_PARM2(ctx)", 3: "PT_REGS_PARM3(ctx)", 4: "PT_REGS_PARM4(ctx)", 5: "PT_REGS_PARM5(ctx)", 6: "PT_REGS_PARM6(ctx)"}.get(n, "PT_REGS_PARM1(ctx)")
+    return {1: "PT_REGS_PARM1(ctx)", 2: "PT_REGS_PARM2(ctx)", 3: "PT_REGS_PARM3(ctx)", 4: "PT_REGS_PARM4(ctx)", 5: "PT_REGS_PARM5(ctx)", 6: "PT_REGS_PARM6(ctx)"}.get(n, "PT_REGS_PARM3(ctx)")
 
 
 def build_bpf_text(args) -> str:
@@ -284,21 +282,21 @@ static __always_inline void inc_hist(struct hist_key *key) {{ u64 zero = 0, *val
 static __always_inline void inc_count(struct size_count_key *key) {{ u64 zero = 0, *val = size_counts.lookup(key); if (!val) {{ size_counts.update(key, &zero); val = size_counts.lookup(key); }} if (val) __sync_fetch_and_add(val, 1); }}
 static __always_inline int record_io(struct pt_regs *ctx, u32 op) {{
     u64 zc_ctx = {zc_ctx_expr};
-    u64 device_key = zc_ctx;
-    u64 req = 0, bytes = 0;
-    if (zc_ctx == 0) return 0;
+    u64 qctx = 0, device_key = 0, req = 0, bytes = 0;
+    bpf_probe_read_user(&qctx, sizeof(qctx), (void *)(zc_ctx + {args.zc_ctx_qctx_offset}ULL)); if (qctx == 0) return 0;
+    bpf_probe_read_user(&device_key, sizeof(device_key), (void *)(qctx + {args.qctx_ctrl_offset}ULL)); if (device_key == 0) return 0;
     bpf_probe_read_user(&req, sizeof(req), (void *)(zc_ctx + {args.zc_ctx_req_offset}ULL)); if (req == 0) return 0;
     bpf_probe_read_user(&bytes, sizeof(bytes), (void *)(req + {args.req_size_offset}ULL)); if (bytes == 0 || bytes > {args.max_size}ULL) return 0;
     u32 tid = (u32)bpf_get_current_pid_tgid(); save_comm(tid);
-    struct stat_key skey = {{}}; skey.device_key = device_key; skey.direction = {DIR_EGRESS}; skey.op = op; skey.tid = tid; skey.mode = {MODE_DPU_RDMA_ZC_HANDLE};
+    struct stat_key skey = {{}}; skey.device_key = device_key; skey.direction = {DIR_EGRESS}; skey.op = op; skey.tid = tid; skey.mode = {MODE_DPU_RDMA_ZC_DONE};
     struct stat_val zero = {{}}, *val = stats.lookup(&skey); if (!val) {{ stats.update(&skey, &zero); val = stats.lookup(&skey); }}
     if (val) {{ __sync_fetch_and_add(&val->ios, 1); __sync_fetch_and_add(&val->bytes, bytes); __sync_fetch_and_add(&val->sized_ios, 1); }}
     struct hist_key hkey = {{}}; hkey.device_key = device_key; hkey.direction = {DIR_EGRESS}; hkey.op = op; hkey.tid = tid; hkey.slot = bpf_log2l(bytes ? bytes : 1); inc_hist(&hkey);
     struct size_count_key ckey = {{}}; ckey.device_key = device_key; ckey.direction = {DIR_EGRESS}; ckey.op = op; ckey.tid = tid; ckey.bytes = (u32)bytes; inc_count(&ckey);
     return 0;
 }}
-int trace_zc_read_handle(struct pt_regs *ctx) {{ return record_io(ctx, {OP_READ}); }}
-int trace_zc_write_handle(struct pt_regs *ctx) {{ return record_io(ctx, {OP_WRITE}); }}
+int trace_zc_read_done(struct pt_regs *ctx) {{ return record_io(ctx, {OP_READ}); }}
+int trace_zc_write_done(struct pt_regs *ctx) {{ return record_io(ctx, {OP_WRITE}); }}
 """
 
 
@@ -347,21 +345,21 @@ def parse_args():
     parser = argparse.ArgumentParser(description="BCC uprobe observer for validated BlueField DPU/SNAP RDMA-ZC IO sizes")
     parser.add_argument("--pid", type=int, help="snap_service host pid; auto-detected when omitted")
     parser.add_argument("--binary", help="path to snap_service; auto-detected when omitted")
-    parser.add_argument("--device-map", type=parse_device_map, default={}, help="optional comma-separated key=name map; key is RDMA-ZC devctx/zc_ctx by default")
-    parser.add_argument("--no-auto-device-names", action="store_true", help="disable experimental automatic devctx->name resolution")
+    parser.add_argument("--device-map", type=parse_device_map, default={}, help="optional comma-separated key=name map")
+    parser.add_argument("--no-auto-device-names", action="store_true", help="disable automatic ctrl->backend bdev name resolution")
     parser.add_argument("--debug-resolve", action="store_true", help="print every automatic device-name resolution attempt")
-    parser.add_argument("--name-chains", type=parse_name_chains, default=DEFAULT_NAME_CHAINS, help="comma-separated root_off:mid_off:name_off chains; diagnostic only for devctx-based mode")
+    parser.add_argument("--name-chains", type=parse_name_chains, default=DEFAULT_NAME_CHAINS, help="comma-separated root_off:mid_off:name_off chains; default includes validated fast paths")
     parser.add_argument("--generic-name-scan", action="store_true", help="enable experimental generic depth-2 fallback name scan; can produce false positives")
-    parser.add_argument("--generic-root-max", type=parse_int_auto, default=0x400, help="bytes to scan from devctx for generic name fallback")
+    parser.add_argument("--generic-root-max", type=parse_int_auto, default=0x400, help="bytes to scan from ctrl for generic name fallback")
     parser.add_argument("--generic-mid-max", type=parse_int_auto, default=0x3000, help="bytes to scan from mid objects for generic name fallback")
     parser.add_argument("--generic-name-offsets", type=parse_offset_list, default=DEFAULT_GENERIC_NAME_OFFSETS, help="comma-separated backend name offsets for generic fallback")
     parser.add_argument("--interval", type=float, default=1.0, help="print interval in seconds")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON lines")
     parser.add_argument("--hist", action="store_true", help="print log2 size histogram")
     parser.add_argument("--no-size-counts", action="store_true", help="disable exact IO size byte counts; enabled by default")
-    parser.add_argument("--zc-ctx-arg", type=int, default=1, choices=[1, 2, 3, 4, 5, 6], help="argument containing RDMA-ZC devctx/zc_ctx; handle_read/write uses arg1")
-    parser.add_argument("--zc-ctx-qctx-offset", type=parse_int_auto, default=0x8, help="unused in devctx mode; kept for compatibility")
-    parser.add_argument("--qctx-ctrl-offset", type=parse_int_auto, default=0x0, help="unused in devctx mode; kept for compatibility")
+    parser.add_argument("--zc-ctx-arg", type=int, default=3, choices=[1, 2, 3, 4, 5, 6])
+    parser.add_argument("--zc-ctx-qctx-offset", type=parse_int_auto, default=0x8)
+    parser.add_argument("--qctx-ctrl-offset", type=parse_int_auto, default=0x0)
     parser.add_argument("--zc-ctx-req-offset", type=parse_int_auto, default=0x40)
     parser.add_argument("--req-size-offset", type=parse_int_auto, default=0xD0)
     parser.add_argument("--max-size", type=parse_int_auto, default=16 * 1024 * 1024)
@@ -380,7 +378,7 @@ def main() -> int:
     auto_names = not args.no_auto_device_names
     proc_maps = parse_proc_maps(pid) if auto_names else []
     device_map = dict(args.device_map); failed_log = set(); seen_device_keys = set()
-    selected = {"mode": "dpu-snap-rdma-zc-handle", "pid": pid, "binary": binary, "read_symbol": READ_SYMBOL, "write_symbol": WRITE_SYMBOL, "device_key": "handle_arg0_zc_ctx", "size": "*(zc_ctx+0x40)+0xd0", "size_counts_enabled": size_counts_enabled, "auto_device_names": auto_names, "debug_resolve": args.debug_resolve, "name_chains": [tuple(hex(x) for x in c) for c in args.name_chains], "generic_name_scan": args.generic_name_scan, "generic_root_max": hex(args.generic_root_max), "generic_mid_max": hex(args.generic_mid_max), "generic_name_offsets": [hex(x) for x in args.generic_name_offsets]}
+    selected = {"mode": "dpu-snap-rdma-zc-done", "pid": pid, "binary": binary, "size_counts_enabled": size_counts_enabled, "auto_device_names": auto_names, "debug_resolve": args.debug_resolve, "name_chains": [tuple(hex(x) for x in c) for c in args.name_chains], "generic_name_scan": args.generic_name_scan, "generic_root_max": hex(args.generic_root_max), "generic_mid_max": hex(args.generic_mid_max), "generic_name_offsets": [hex(x) for x in args.generic_name_offsets]}
     if args.dry_run: print(json_dumps(selected)); return 0
     try:
         from bcc import BPF
@@ -388,12 +386,12 @@ def main() -> int:
         print(f"failed to import BCC: {exc}", file=sys.stderr); return 2
     b = BPF(text=build_bpf_text(args))
     try:
-        attach_uprobe_compat(b, binary, READ_SYMBOL, "trace_zc_read_handle", pid)
-        attach_uprobe_compat(b, binary, WRITE_SYMBOL, "trace_zc_write_handle", pid)
+        attach_uprobe_compat(b, binary, READ_SYMBOL, "trace_zc_read_done", pid)
+        attach_uprobe_compat(b, binary, WRITE_SYMBOL, "trace_zc_write_done", pid)
     except Exception as exc:
         print(f"attach failed: {exc}", file=sys.stderr); return 2
     print(f"attached: {READ_SYMBOL},{WRITE_SYMBOL}@{binary}", file=sys.stderr)
-    print(f"mode=dpu-snap-rdma-zc-handle pid={pid} binary={binary} device_key=handle_arg0_zc_ctx size=req+0xd0 size_counts={size_counts_enabled}", file=sys.stderr)
+    print(f"mode=dpu-snap-rdma-zc-done pid={pid} binary={binary} device_key=ctrl size_counts={size_counts_enabled} auto_device_names={auto_names}", file=sys.stderr)
     stop = False
     def _stop(_signo, _frame):
         nonlocal stop; stop = True
@@ -429,7 +427,7 @@ def main() -> int:
             if size_counts_enabled:
                 for (device_key, direction, op, tid, size), count in sorted(d_size_counts.items()):
                     size_rows.append({"device_key": f"0x{device_key:x}", "device": label(device_key), "direction": DIR_NAMES.get(direction, str(direction)), "op": OP_NAMES.get(op, f"op{op}"), "tid": tid, "thread": names.get(tid, ""), "size_bytes": size, "count": count})
-            print(json_dumps({"ts": time.time(), "interval": args.interval, "stats": rows, "size_counts": size_rows, "mode": "dpu-snap-rdma-zc-handle"})); continue
+            print(json_dumps({"ts": time.time(), "interval": args.interval, "stats": rows, "size_counts": size_rows, "mode": "dpu-snap-rdma-zc-done"})); continue
         print(time.strftime("%H:%M:%S"))
         for (device_key, direction, op, tid, mode), (ios, bytes_, sized_ios) in sorted(d_stats.items()):
             avg = bytes_ / sized_ios if sized_ios else 0
