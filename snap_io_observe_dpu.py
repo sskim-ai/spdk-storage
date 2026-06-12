@@ -16,15 +16,15 @@ from typing import Dict, Iterable, Optional, Tuple
 
 from common import diagnostics, json_dumps, print_log2_hist, require_root
 
-READ_SYMBOL = "snap_bdev_spdk_rdma_zc_handle_read"
-WRITE_SYMBOL = "snap_bdev_spdk_rdma_zc_handle_write"
+READ_SYMBOL = "snap_bdev_spdk_rdma_zc_read_done"
+WRITE_SYMBOL = "snap_bdev_spdk_rdma_zc_write_done"
 DIR_EGRESS = 1
 DIR_NAMES = {DIR_EGRESS: "egress"}
 OP_READ = 0
 OP_WRITE = 1
 OP_NAMES = {OP_READ: "read", OP_WRITE: "write"}
-MODE_DPU_RDMA_ZC_HANDLE_CTRL = 8
-MODE_NAMES = {MODE_DPU_RDMA_ZC_HANDLE_CTRL: "dpu-rdma-zc-handle-ctrl"}
+MODE_DPU_RDMA_ZC_DONE = 6
+MODE_NAMES = {MODE_DPU_RDMA_ZC_DONE: "dpu-rdma-zc-done"}
 
 # Fast paths discovered on the current SNAP layout. Generic scanning is kept as
 # an explicit diagnostic mode only because it can produce false positives.
@@ -261,7 +261,7 @@ def device_label(device_key: int, device_map: Dict[int, str], pid: int, args, ma
 
 
 def arg_expr(n: int) -> str:
-    return {1: "PT_REGS_PARM1(ctx)", 2: "PT_REGS_PARM2(ctx)", 3: "PT_REGS_PARM3(ctx)", 4: "PT_REGS_PARM4(ctx)", 5: "PT_REGS_PARM5(ctx)", 6: "PT_REGS_PARM6(ctx)"}.get(n, "PT_REGS_PARM1(ctx)")
+    return {1: "PT_REGS_PARM1(ctx)", 2: "PT_REGS_PARM2(ctx)", 3: "PT_REGS_PARM3(ctx)", 4: "PT_REGS_PARM4(ctx)", 5: "PT_REGS_PARM5(ctx)", 6: "PT_REGS_PARM6(ctx)"}.get(n, "PT_REGS_PARM3(ctx)")
 
 
 def build_bpf_text(args) -> str:
@@ -288,15 +288,15 @@ static __always_inline int record_io(struct pt_regs *ctx, u32 op) {{
     bpf_probe_read_user(&req, sizeof(req), (void *)(zc_ctx + {args.zc_ctx_req_offset}ULL)); if (req == 0) return 0;
     bpf_probe_read_user(&bytes, sizeof(bytes), (void *)(req + {args.req_size_offset}ULL)); if (bytes == 0 || bytes > {args.max_size}ULL) return 0;
     u32 tid = (u32)bpf_get_current_pid_tgid(); save_comm(tid);
-    struct stat_key skey = {{}}; skey.device_key = device_key; skey.direction = {DIR_EGRESS}; skey.op = op; skey.tid = tid; skey.mode = {MODE_DPU_RDMA_ZC_HANDLE_CTRL};
+    struct stat_key skey = {{}}; skey.device_key = device_key; skey.direction = {DIR_EGRESS}; skey.op = op; skey.tid = tid; skey.mode = {MODE_DPU_RDMA_ZC_DONE};
     struct stat_val zero = {{}}, *val = stats.lookup(&skey); if (!val) {{ stats.update(&skey, &zero); val = stats.lookup(&skey); }}
     if (val) {{ __sync_fetch_and_add(&val->ios, 1); __sync_fetch_and_add(&val->bytes, bytes); __sync_fetch_and_add(&val->sized_ios, 1); }}
     struct hist_key hkey = {{}}; hkey.device_key = device_key; hkey.direction = {DIR_EGRESS}; hkey.op = op; hkey.tid = tid; hkey.slot = bpf_log2l(bytes ? bytes : 1); inc_hist(&hkey);
     struct size_count_key ckey = {{}}; ckey.device_key = device_key; ckey.direction = {DIR_EGRESS}; ckey.op = op; ckey.tid = tid; ckey.bytes = (u32)bytes; inc_count(&ckey);
     return 0;
 }}
-int trace_zc_read_handle(struct pt_regs *ctx) {{ return record_io(ctx, {OP_READ}); }}
-int trace_zc_write_handle(struct pt_regs *ctx) {{ return record_io(ctx, {OP_WRITE}); }}
+int trace_zc_read_done(struct pt_regs *ctx) {{ return record_io(ctx, {OP_READ}); }}
+int trace_zc_write_done(struct pt_regs *ctx) {{ return record_io(ctx, {OP_WRITE}); }}
 """
 
 
@@ -357,7 +357,7 @@ def parse_args():
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON lines")
     parser.add_argument("--hist", action="store_true", help="print log2 size histogram")
     parser.add_argument("--no-size-counts", action="store_true", help="disable exact IO size byte counts; enabled by default")
-    parser.add_argument("--zc-ctx-arg", type=int, default=1, choices=[1, 2, 3, 4, 5, 6], help="argument containing zc_ctx; handle_read/write uses arg1")
+    parser.add_argument("--zc-ctx-arg", type=int, default=3, choices=[1, 2, 3, 4, 5, 6])
     parser.add_argument("--zc-ctx-qctx-offset", type=parse_int_auto, default=0x8)
     parser.add_argument("--qctx-ctrl-offset", type=parse_int_auto, default=0x0)
     parser.add_argument("--zc-ctx-req-offset", type=parse_int_auto, default=0x40)
@@ -378,7 +378,7 @@ def main() -> int:
     auto_names = not args.no_auto_device_names
     proc_maps = parse_proc_maps(pid) if auto_names else []
     device_map = dict(args.device_map); failed_log = set(); seen_device_keys = set()
-    selected = {"mode": "dpu-snap-rdma-zc-handle-ctrl", "pid": pid, "binary": binary, "read_symbol": READ_SYMBOL, "write_symbol": WRITE_SYMBOL, "device_key": "*( *(arg0+0x8) + 0x0 )", "size_counts_enabled": size_counts_enabled, "auto_device_names": auto_names, "debug_resolve": args.debug_resolve, "name_chains": [tuple(hex(x) for x in c) for c in args.name_chains], "generic_name_scan": args.generic_name_scan, "generic_root_max": hex(args.generic_root_max), "generic_mid_max": hex(args.generic_mid_max), "generic_name_offsets": [hex(x) for x in args.generic_name_offsets]}
+    selected = {"mode": "dpu-snap-rdma-zc-done", "pid": pid, "binary": binary, "size_counts_enabled": size_counts_enabled, "auto_device_names": auto_names, "debug_resolve": args.debug_resolve, "name_chains": [tuple(hex(x) for x in c) for c in args.name_chains], "generic_name_scan": args.generic_name_scan, "generic_root_max": hex(args.generic_root_max), "generic_mid_max": hex(args.generic_mid_max), "generic_name_offsets": [hex(x) for x in args.generic_name_offsets]}
     if args.dry_run: print(json_dumps(selected)); return 0
     try:
         from bcc import BPF
@@ -386,12 +386,12 @@ def main() -> int:
         print(f"failed to import BCC: {exc}", file=sys.stderr); return 2
     b = BPF(text=build_bpf_text(args))
     try:
-        attach_uprobe_compat(b, binary, READ_SYMBOL, "trace_zc_read_handle", pid)
-        attach_uprobe_compat(b, binary, WRITE_SYMBOL, "trace_zc_write_handle", pid)
+        attach_uprobe_compat(b, binary, READ_SYMBOL, "trace_zc_read_done", pid)
+        attach_uprobe_compat(b, binary, WRITE_SYMBOL, "trace_zc_write_done", pid)
     except Exception as exc:
         print(f"attach failed: {exc}", file=sys.stderr); return 2
     print(f"attached: {READ_SYMBOL},{WRITE_SYMBOL}@{binary}", file=sys.stderr)
-    print(f"mode=dpu-snap-rdma-zc-handle-ctrl pid={pid} binary={binary} device_key=ctrl size_counts={size_counts_enabled} auto_device_names={auto_names}", file=sys.stderr)
+    print(f"mode=dpu-snap-rdma-zc-done pid={pid} binary={binary} device_key=ctrl size_counts={size_counts_enabled} auto_device_names={auto_names}", file=sys.stderr)
     stop = False
     def _stop(_signo, _frame):
         nonlocal stop; stop = True
@@ -427,11 +427,11 @@ def main() -> int:
             if size_counts_enabled:
                 for (device_key, direction, op, tid, size), count in sorted(d_size_counts.items()):
                     size_rows.append({"device_key": f"0x{device_key:x}", "device": label(device_key), "direction": DIR_NAMES.get(direction, str(direction)), "op": OP_NAMES.get(op, f"op{op}"), "tid": tid, "thread": names.get(tid, ""), "size_bytes": size, "count": count})
-            print(json_dumps({"ts": time.time(), "interval": args.interval, "stats": rows, "size_counts": size_rows, "mode": "dpu-snap-rdma-zc-handle-ctrl"})); continue
+            print(json_dumps({"ts": time.time(), "interval": args.interval, "stats": rows, "size_counts": size_rows, "mode": "dpu-snap-rdma-zc-done"})); continue
         print(time.strftime("%H:%M:%S"))
         for (device_key, direction, op, tid, mode), (ios, bytes_, sized_ios) in sorted(d_stats.items()):
             avg = bytes_ / sized_ios if sized_ios else 0
-            print(f"device={label(device_key):<18} device_key=0x{device_key:x} {DIR_NAMES.get(direction, str(direction)):<8} {MODE_NAMES.get(mode, str(mode)):<25} tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, f'op{op}'):<8} ios={ios:<10} bytes={bytes_:<14} avg_size={avg:.1f}")
+            print(f"device={label(device_key):<18} device_key=0x{device_key:x} {DIR_NAMES.get(direction, str(direction)):<8} {MODE_NAMES.get(mode, str(mode)):<20} tid={tid:<8} comm={names.get(tid, ''):<16} {OP_NAMES.get(op, f'op{op}'):<8} ios={ios:<10} bytes={bytes_:<14} avg_size={avg:.1f}")
         if args.hist:
             for device_key, direction, op, tid in sorted({(dev, d, o, t) for dev, d, o, t, _ in d_hist}):
                 rows = {slot: cnt for (dev, d, o, t, slot), cnt in d_hist.items() if dev == device_key and d == direction and o == op and t == tid}
